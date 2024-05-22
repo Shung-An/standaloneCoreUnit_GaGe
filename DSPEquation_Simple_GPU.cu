@@ -210,7 +210,6 @@ __global__ void resetInteger(int* value) {
 }
 
 // Helper function for using CUDA.
-
 extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	unsigned long skip, unsigned long sample_size,
 	__int64 size, int blocks, int threads,
@@ -220,94 +219,67 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 
 	blocks = 48 * 32;
 	threads = 768;
-	clock_t start_Time, current_time;
-	double elapsed_time;
 
-	int CPUresult = 0;// debug mode
+	float elapsedTime1, elapsedTime2, elapsedTime3;
+	cudaEvent_t start, stop, kernel1_start, kernel1_stop, kernel2_start, kernel2_stop, fileWrite_start, fileWrite_stop;
+
+	// Create CUDA events
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventCreate(&kernel1_start);
+	cudaEventCreate(&kernel1_stop);
+	cudaEventCreate(&kernel2_start);
+	cudaEventCreate(&kernel2_stop);
+	cudaEventCreate(&fileWrite_start);
+	cudaEventCreate(&fileWrite_stop);
+
+	// Record the start event
+	cudaEventRecord(start, 0);
+
+	int CPUresult = 0; // debug mode
 	int CheckRaw = 0;
 	int AnalysisFile = 1;
-	int timer = 0;
 
-	//int* check_dev =  (int*)malloc(size/48 * sizeof(int));
 	int h_accTemp2 = 0;
 
-	FILE* fptr;
+	FILE* fptr = nullptr;
 	if (AnalysisFile == 1) {
 		fptr = fopen("Analysis.txt", "a");
 	}
 
-	if (timer == 1) start_Time = clock();
+	if (CPUresult == 1) {
+		cudaStatus = cudaMemcpy(h_dev_a, a, size * sizeof(short), cudaMemcpyDeviceToHost);
+	}
 
-
-	if (CPUresult == 1) cudaStatus = cudaMemcpy(h_dev_a, a, size * sizeof(short), cudaMemcpyDeviceToHost);
-	////////////////////////////////////////////////////
-
-	//demodulationAt12 << <blocks, threads >> > ((short*)a, size, dev_a);
+	// Time for demodulationAt8 kernel
+	cudaEventRecord(kernel1_start, 0);
 	demodulationAt8 << <blocks, threads >> > ((short*)a, size, dev_a);
+	cudaEventRecord(kernel1_stop, 0);
+
+	// Time for reduceShfl kernel
+	cudaEventRecord(kernel2_start, 0);
 	reduceShfl << <blocks, threads >> > (dev_a, d_accTemp2, size / 32);
+	cudaEventRecord(kernel2_stop, 0);
+
 	cudaMemcpy(h_odata, d_accTemp2, 1 * sizeof(int), cudaMemcpyDeviceToHost);
 	resetInteger << <1, 1 >> > ((int*)d_accTemp2);
 
 	cudaStatus = cudaDeviceSynchronize();
 
-	////////////////////////////////////////////////////
-	// cudaDeviceSynchronize waits for the kernel to finish, and returns
-	// any errors encountered during the launch.
+	// Record the stop event
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
 
+	// Calculate the elapsed times
+	cudaEventElapsedTime(&elapsedTime1, kernel1_start, kernel1_stop);
+	cudaEventElapsedTime(&elapsedTime2, kernel2_start, kernel2_stop);
+	cudaEventElapsedTime(&elapsedTime3, start, stop);
+
+	// Record the start event for file writing
+	cudaEventRecord(fileWrite_start, 0);
 
 	if (CPUresult == 1) {
 		for (int i = 0; i < size / 32; i++) {
-			/*int a1 = h_dev_a[i * 48];
-			int a2 = h_dev_a[i * 48 + 1];
-			int a3 = h_dev_a[i * 48 + 2];
-			int a4 = h_dev_a[i * 48 + 3];
-			int a5 = h_dev_a[i * 48 + 4];
-			int a6 = h_dev_a[i * 48 + 5];
-			int a7 = h_dev_a[i * 48 + 6];
-			int a8 = h_dev_a[i * 48 + 7];
-			int a9 = h_dev_a[i * 48 + 8];
-			int a10 = h_dev_a[i * 48 + 9];
-			int a11 = h_dev_a[i * 48 + 10];
-			int a12 = h_dev_a[i * 48 + 11];
-			int a13 = h_dev_a[i * 48 + 12];
-			int a14 = h_dev_a[i * 48 + 13];
-			int a15 = h_dev_a[i * 48 + 14];
-			int a16 = h_dev_a[i * 48 + 15];
-			int a17 = h_dev_a[i * 48 + 16];
-			int a18 = h_dev_a[i * 48 + 17];
-			int a19 = h_dev_a[i * 48 + 18];
-			int a20 = h_dev_a[i * 48 + 19];
-			int a21 = h_dev_a[i * 48 + 20];
-			int a22 = h_dev_a[i * 48 + 21];
-			int a23 = h_dev_a[i * 48 + 22];
-			int a24 = h_dev_a[i * 48 + 23];
-			int a25 = h_dev_a[i * 48 + 24];
-			int a26 = h_dev_a[i * 48 + 25];
-			int a27 = h_dev_a[i * 48 + 26];
-			int a28 = h_dev_a[i * 48 + 27];
-			int a29 = h_dev_a[i * 48 + 28];
-			int a30 = h_dev_a[i * 48 + 29];
-			int a31 = h_dev_a[i * 48 + 30];
-			int a32 = h_dev_a[i * 48 + 31];
-			int a33 = h_dev_a[i * 48 + 32];
-			int a34 = h_dev_a[i * 48 + 33];
-			int a35 = h_dev_a[i * 48 + 34];
-			int a36 = h_dev_a[i * 48 + 35];
-			int a37 = h_dev_a[i * 48 + 36];
-			int a38 = h_dev_a[i * 48 + 37];
-			int a39 = h_dev_a[i * 48 + 38];
-			int a40 = h_dev_a[i * 48 + 39];
-			int a41 = h_dev_a[i * 48 + 40];
-			int a42 = h_dev_a[i * 48 + 41];
-			int a43 = h_dev_a[i * 48 + 42];
-			int a44 = h_dev_a[i * 48 + 43];
-			int a45 = h_dev_a[i * 48 + 44];
-			int a46 = h_dev_a[i * 48 + 45];
-			int a47 = h_dev_a[i * 48 + 46];
-			int a48 = h_dev_a[i * 48 + 47];
-			int temp = 0;
-			temp = (a25 - a1) * (a2 - a26) + (a27 - a3) * (a4 - a28) + (a29 - a5) * (a6 - a30) + (a7 - a31) * (a8 - a32) + (a9 - a33) * (a10 - a34) + (a11 - a35) * (a12 - a36) + (a13 - a37) * (a14 - a38) + (a15 - a39) * (a16 - a40) + (a17 - a41) * (a18 - a42) + (a43 - a19) * (a20 - a44) + (a45 - a21) * (a22 - a46) + (a47 - a23) * (a24 - a48);
-			*/
 			int a1 = h_dev_a[i * 32];
 			int a2 = h_dev_a[i * 32 + 1];
 			int a3 = h_dev_a[i * 32 + 2];
@@ -342,40 +314,52 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 			int a32 = h_dev_a[i * 32 + 31];
 			int temp = 0;
 			temp = (a17 - a1) * (a2 - a18) + (a19 - a3) * (a4 - a20) + (a5 - a21) * (a6 - a22) + (a7 - a23) * (a8 - a24) + (a9 - a25) * (a10 - a26) + (a11 - a27) * (a12 - a28) + (a29 - a13) * (a14 - a30) + (a31 - a15) * (a16 - a32);
-
-
-
 			h_accTemp2 += temp;
-			//if(temp!=check_dev[i]) printf("\n%d\nCPU: %d\nGPU: %d\n", i, temp, check_dev[i]);
-
 		}
 	}
-
 
 	if (CheckRaw != 1) {
 		if (CPUresult == 1) {
 			if (AnalysisFile == 1) {
 				fprintf(fptr, "%d\t%d\t%d\n", u32LoopCount, h_accTemp2, h_odata[0]);
-				fclose(fptr);
 			}
 		}
 		else {
 			if (AnalysisFile == 1) {
 				fprintf(fptr, "%d\t%d\n", u32LoopCount, h_odata[0]);
-				fclose(fptr);
 			}
 		}
 	}
 
+	// Record the stop event for file writing
+	cudaEventRecord(fileWrite_stop, 0);
+	cudaEventSynchronize(fileWrite_stop);
 
-	fclose(fptr);
-	// Get the current time
-	if (timer == 1) {
-		current_time = clock();
-		elapsed_time = ((double)(current_time - start_Time)) / CLOCKS_PER_SEC * 1000;
-		printf("Elapsed Time: %.2f ms\r", elapsed_time);
+	// Calculate the elapsed time for file writing
+	float elapsedTimeFileWrite;
+	cudaEventElapsedTime(&elapsedTimeFileWrite, fileWrite_start, fileWrite_stop);
+
+	// Close the file if it was opened
+	if (fptr != nullptr) {
+		fclose(fptr);
 	}
 
+	printf("Time for demodulationAt8: %.2f ms\n", elapsedTime1);
+	printf("Time for reduceShfl: %.2f ms\n", elapsedTime2);
+	printf("Total Elapsed Time: %.2f ms\n", elapsedTime3);
+	printf("Time for file writing: %.2f ms\n", elapsedTimeFileWrite);
+
+	// Destroy CUDA events
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	cudaEventDestroy(kernel1_start);
+	cudaEventDestroy(kernel1_stop);
+	cudaEventDestroy(kernel2_start);
+	cudaEventDestroy(kernel2_stop);
+	cudaEventDestroy(fileWrite_start);
+	cudaEventDestroy(fileWrite_stop);
 
 	return cudaStatus;
 }
+
+

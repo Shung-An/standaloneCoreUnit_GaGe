@@ -1060,7 +1060,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		fprintf(fptr, "//////\nBuffer size (Samples)\n%d\nSampling Rate (Hz)\n%d\n///\n", u32TransferSizeSamples, g_CsAcqCfg.i64SampleRate);
 		fclose(fptr);
 
-		int timer = 1;
+		int timer = 0;
 
 		// Steam acqusition has started.
 		// loop until either we've done the number of segments we want, or
@@ -1071,8 +1071,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		double elapsed_time, transfer_time, step_time;
 
 		while (!(bDone || bStreamCompletedSuccess))
-		{
-			step_start_time = clock();
+		{	
+			if (timer == 1) {
+				step_start_time = clock();
+				}
 			// Check if user has aborted or an error has occured
 			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort, 0))
 				break;
@@ -1253,9 +1255,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 			u32LoopCount++;
 
-			step_end_time = clock();
-			step_time = ((double)(step_end_time - step_start_time)) / CLOCKS_PER_SEC * 1000;
-			printf("One Step Time: %.2f ms\n", step_time);
+			if (timer == 1) {
+				step_end_time = clock();
+				step_time = ((double)(step_end_time - step_start_time)) / CLOCKS_PER_SEC * 1000;
+				printf("One Step Time: %.2f ms\n", step_time);
+			}
 		}
 
 
