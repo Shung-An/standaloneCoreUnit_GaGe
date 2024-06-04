@@ -13,12 +13,6 @@
 #define SMEMDIM 100 
 #define Global_N 1000704
 
-// Function declaration
-extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
-	unsigned long skip, unsigned long sample_size,
-	__int64 size, int blocks, int threads,
-	int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
-	int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors);
 
 
 
@@ -163,6 +157,47 @@ __global__ void demodulationCorrelationAt8(short* a, __int64 numElements, int* c
 	}
 }
 
+__global__ void demodulationCorrelationAt8Light(short* a, __int64 numElements, float* correlationMatrix) {
+	int index = blockDim.x * blockIdx.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+
+	int matrixSize = numElements / 32; // the number of matrices will generate or the number of segments
+	int elementIndex = index % 64; // Each thread works on one element of the 8x8 correlation matrix
+	int segmentIndex = index / 64; // Determines which 32-element segment we're working on
+
+	// Declare shared memory
+	__shared__ float sharedSegment[32];
+
+	// Only the first 32 threads in the block load data into shared memory
+	if (threadIdx.x < 32) {
+		int segmentThreadIdx = threadIdx.x;
+		if (segmentIndex * 32 + segmentThreadIdx < numElements) {
+			sharedSegment[segmentThreadIdx] = static_cast<float>(a[segmentIndex * 32 + segmentThreadIdx]);
+		}
+		else {
+			sharedSegment[segmentThreadIdx] = 0.0f; // Handle out-of-bound access gracefully
+		}
+	}
+
+	__syncthreads(); // Ensure all threads have loaded their data into shared memory
+
+	if (segmentIndex < matrixSize) {
+		int row = elementIndex / 8;
+		int col = elementIndex % 8;
+
+		float value1 = sharedSegment[row * 2];
+		float value2 = sharedSegment[(row + 8) * 2];
+		float value3 = sharedSegment[col * 2 + 1];
+		float value4 = sharedSegment[(col + 8) * 2 + 1];
+
+		float corrValue = (value1 - value2) * (value3 - value4);
+
+		correlationMatrix[elementIndex * matrixSize + segmentIndex] = corrValue;				// Correlation matrix, one column is a single correlation matrix
+	}
+}
+
+
+
 
 
 
@@ -251,12 +286,17 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	unsigned long skip, unsigned long sample_size,
 	__int64 size, int blocks, int threads,
 	int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
-	int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors)
+	int correlationMatrixSize, int N, cublasHandle_t handle, float* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors)
 {
 	cudaError_t cudaStatus = cudaSuccess;
 
-	blocks = 48 * 32;
-	threads = 768;						// In total 1179648 threads, In total 1000704 segment to work
+	//blocks = 48 * 32;
+	//threads = 768;						// In total 1179648 threads, In total 1000704 segment to work
+
+	// Kernel launch configuration
+	int blockSize = 64; // You can experiment with this value
+	int totalThreads = (size / 32) * 64;
+	int gridSize = (totalThreads + blockSize - 1) / blockSize;
 
 	int CPUresult = 0; // debug mode
 	int CheckRaw = 0;
@@ -275,18 +315,18 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 
 	// a is dbuffer, size is  u32TransferSizeSamples, cudaMalloc((int**)&dev_a, u32TransferSizeSamples / 48 * sizeof(int));
 	//demodulationAt8 << <blocks, threads >> > ((short*)a, size, dev_a);
-	demodulationCorrelationAt8 << <blocks, threads >> > ((short*)dev_a, size, d_correlationMatrix);
+	demodulationCorrelationAt8Light <<<gridSize, blockSize>>> ((short*)a, size, d_correlationMatrix);
 
 	// Convert int matrix to float matrix
-	int matrixSize = correlationMatrixSize;
-	int gridSize = (matrixSize + threads - 1) / threads;
-	intToFloat << <gridSize, threads >> > (d_correlationMatrix, d_floatMatrix, matrixSize);
+	//int matrixSize = correlationMatrixSize;
+	//gridSize = (matrixSize + blockSize - 1) / blockSize;
+	//intToFloat <<<gridSize, blockSize >>> (d_correlationMatrix, d_floatMatrix, matrixSize);
 	
 	// Perform matrix-vector multiplication using cuBLAS
 	float alpha = 1.0f;
 	float beta = 0.0f;
 	cublasStatus_t cublasStatus = cublasSgemv(handle, CUBLAS_OP_N, 64, N, &alpha,
-		d_floatMatrix, 64,
+		d_correlationMatrix, 64,
 		d_scaling_factors, 1,
 		&beta, d_averageMatrix, 1);
 

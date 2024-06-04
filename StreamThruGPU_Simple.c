@@ -64,7 +64,7 @@ extern "C" {
 		unsigned long skip, unsigned long sample_size,
 		__int64 size, int blocks, int threads,
 		int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
-		int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors);
+		int correlationMatrixSize, int N, cublasHandle_t handle, float* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors);
 
 	extern int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length);
 
@@ -919,7 +919,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	int* dev_a = NULL;
 	int* d_accTemp = NULL;
 	int* d_accTemp2 = NULL;
-	int* d_correlationMatrix = NULL;
+	float* d_correlationMatrix = NULL;
 	float* d_floatMatrix = NULL;
 	float* d_averageMatrix = NULL;
 	float* d_scaling_factors = NULL;
@@ -1105,63 +1105,91 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		// Convert the transfer size to BYTEs or WORDs depending on the card.
 		u32TransferSizeSamples = g_StreamConfig.u32BufferSizeBytes / g_CsSysInfo.u32SampleSize;
 
-		// int* h_odata = (int*)malloc(1 * sizeof(int));
-		//int* h_odata = (int*)malloc(32 * sizeof(int));
+		
 		float* h_odata = (float*)malloc(64 * sizeof(float));
 		short* h_dev_a = (short*)malloc(u32TransferSizeSamples * sizeof(short));
 		short* h_dev_a2 = (short*)malloc(u32TransferSizeSamples * sizeof(short));
-		cudaStatus = cudaMalloc((int**)&dev_a, u32TransferSizeSamples / 48 * sizeof(int));
-		cudaStatus = cudaMalloc((void**)&d_accTemp, 1 * sizeof(int));
-		cudaStatus = cudaMalloc((void**)&d_accTemp2, 1 * sizeof(int));
-
-		
-		correlationMatrixSize = (u32TransferSizeSamples / 32) * 64; // the size of correlation matrix for one segment
-		N = u32TransferSizeSamples / 32;		// number of segments, each segment is 32 length
-
 		// Allocate device memory
-		cudaStatus = cudaMalloc((void**)&d_correlationMatrix, correlationMatrixSize * sizeof(int));
+		cudaStatus = cudaMalloc((int**)&dev_a, u32TransferSizeSamples / 48 * sizeof(int));
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "cudaMalloc failed for d_correlationMatrix!");
+			// Handle error...
+			return cudaStatus;
+		}
+		cudaStatus = cudaMalloc((void**)&d_accTemp, 1 * sizeof(int));
+		if (cudaStatus != cudaSuccess) {
+			// Handle error...
+			cudaFree(dev_a);
+			return cudaStatus;
+		}
+		cudaStatus = cudaMalloc((void**)&d_accTemp2, 1 * sizeof(int));
+		if (cudaStatus != cudaSuccess) {
+			// Handle error...
+			cudaFree(dev_a);
+			cudaFree(d_accTemp);
+			return cudaStatus;
+		}
+
+		correlationMatrixSize = (u32TransferSizeSamples / 32) * 64; // Size of correlation matrix for one segment
+		N = u32TransferSizeSamples / 32; // Number of segments, each segment is 32 length
+
+		cudaStatus = cudaMalloc((void**)&d_correlationMatrix, correlationMatrixSize * sizeof(float));
+		if (cudaStatus != cudaSuccess) {
+			// Handle error...
+			cudaFree(dev_a);
+			cudaFree(d_accTemp);
+			cudaFree(d_accTemp2);
 			return cudaStatus;
 		}
 
 		cudaStatus = cudaMalloc((void**)&d_floatMatrix, correlationMatrixSize * sizeof(float));
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "cudaMalloc failed for d_floatMatrix!");
+			// Handle error...
 			cudaFree(d_correlationMatrix);
+			cudaFree(dev_a);
+			cudaFree(d_accTemp);
+			cudaFree(d_accTemp2);
 			return cudaStatus;
 		}
 
 		cudaStatus = cudaMalloc((void**)&d_averageMatrix, 64 * sizeof(float));
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "cudaMalloc failed for d_averageMatrix!");
+			// Handle error...
 			cudaFree(d_correlationMatrix);
 			cudaFree(d_floatMatrix);
+			cudaFree(dev_a);
+			cudaFree(d_accTemp);
+			cudaFree(d_accTemp2);
 			return cudaStatus;
 		}
 
 		cudaStatus = cudaMalloc((void**)&d_scaling_factors, N * sizeof(float));
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "cudaMalloc failed for d_scaling_factors!");
+			// Handle error...
 			cudaFree(d_correlationMatrix);
 			cudaFree(d_floatMatrix);
 			cudaFree(d_averageMatrix);
+			cudaFree(dev_a);
+			cudaFree(d_accTemp);
+			cudaFree(d_accTemp2);
 			return cudaStatus;
 		}
-		//thrust::device_vector<float> d_scaling_factors(N, 1.0f / N);
+
 		// Initialize the array with 1/N
 		float value = 1.0f / N;
 		initializeArrayWithCuda(d_scaling_factors, N, value);
-
 
 		// Create cuBLAS handle
 		cublasHandle_t handle;
 		cublasStatus_t cublasStatus = cublasCreate(&handle);
 		if (cublasStatus != CUBLAS_STATUS_SUCCESS) {
-			fprintf(stderr, "cublasCreate failed!");
+			// Handle error...
 			cudaFree(d_correlationMatrix);
 			cudaFree(d_floatMatrix);
 			cudaFree(d_averageMatrix);
+			cudaFree(d_scaling_factors);
+			cudaFree(dev_a);
+			cudaFree(d_accTemp);
+			cudaFree(d_accTemp2);
 			return cudaErrorInitializationError;
 		}
 
