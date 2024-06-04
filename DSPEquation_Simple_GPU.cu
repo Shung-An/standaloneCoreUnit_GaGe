@@ -5,11 +5,21 @@
 #include <Windows.h>
 #include <stdlib.h>
 #include <time.h>
+#include <thrust/device_vector.h>
+#include <cublas_v2.h>
 
 #define DIM 768
 
 #define SMEMDIM 100 
-#define N 1000704
+#define Global_N 1000704
+
+// Function declaration
+extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
+	unsigned long skip, unsigned long sample_size,
+	__int64 size, int blocks, int threads,
+	int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
+	int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors);
+
 
 
 __global__ void plusOne(unsigned char* a, __int64 numElements, unsigned long skip)
@@ -108,51 +118,53 @@ __global__ void demodulationAt12(short* a, __int64 numElements, int* out)
 
 }
 
-__global__ void demodulationAt8(short* a, __int64 numElements, int* out)
-{
+__global__ void demodulationCorrelationAt8(short* a, __int64 numElements, int* correlationMatrix) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
-#pragma unroll
-	for (int i = index; i < numElements / 32; i += stride)
-	{
-		int a1 = a[i * 32];
-		int a2 = a[i * 32 + 1];
-		int a3 = a[i * 32 + 2];
-		int a4 = a[i * 32 + 3];
-		int a5 = a[i * 32 + 4];
-		int a6 = a[i * 32 + 5];
-		int a7 = a[i * 32 + 6];
-		int a8 = a[i * 32 + 7];
-		int a9 = a[i * 32 + 8];
-		int a10 = a[i * 32 + 9];
-		int a11 = a[i * 32 + 10];
-		int a12 = a[i * 32 + 11];
-		int a13 = a[i * 32 + 12];
-		int a14 = a[i * 32 + 13];
-		int a15 = a[i * 32 + 14];
-		int a16 = a[i * 32 + 15];
-		int a17 = a[i * 32 + 16];
-		int a18 = a[i * 32 + 17];
-		int a19 = a[i * 32 + 18];
-		int a20 = a[i * 32 + 19];
-		int a21 = a[i * 32 + 20];
-		int a22 = a[i * 32 + 21];
-		int a23 = a[i * 32 + 22];
-		int a24 = a[i * 32 + 23];
-		int a25 = a[i * 32 + 24];
-		int a26 = a[i * 32 + 25];
-		int a27 = a[i * 32 + 26];
-		int a28 = a[i * 32 + 27];
-		int a29 = a[i * 32 + 28];
-		int a30 = a[i * 32 + 29];
-		int a31 = a[i * 32 + 30];
-		int a32 = a[i * 32 + 31];
-		int temp = 0;
-		temp = (a17 - a1) * (a2 - a18) + (a19 - a3) * (a4 - a20) + (a5 - a21) * (a6 - a22) + (a7 - a23) * (a8 - a24) + (a9 - a25) * (a10 - a26) + (a11 - a27) * (a12 - a28) + (a29 - a13) * (a14 - a30) + (a31 - a15) * (a16 - a32);
-		out[i] = temp;
-	}
 
+	for (int i = index; i < numElements / 32; i += stride) {
+		// Arrays potentially stored in registers if there are enough registers available
+		int segment[32];  // 128 bytes
+
+		// Initialize the segment array
+		#pragma unroll
+		for (int j = 0; j < 32; j++) {
+			if (i * 32 + j < numElements) {
+				segment[j] = static_cast<int>(a[i * 32 + j]);
+			}
+			else {
+				segment[j] = 0;  // Handle out-of-bound access gracefully
+			}
+		}
+
+		int corrMatrix[64] = { 0 };  // 256 bytes
+
+		// Calculate the correlation matrix
+		#pragma unroll
+		for (int row = 0; row < 8; row++) {
+		#pragma unroll
+			for (int col = 0; col < 8; col++) {
+				int value1 = segment[row * 2];
+				int value2 = segment[(row + 8) * 2];
+				int value3 = segment[col * 2 + 1];
+				int value4 = segment[(col + 8) * 2 + 1];
+				corrMatrix[row * 8 + col] = (value1 - value2) * (value3 - value4);
+			}
+		}
+
+		// Write the correlation matrix back to global memory in a 64 x N format (column-major)
+		#pragma unroll
+		for (int row = 0; row < 8; row++) {
+			#pragma unroll
+			for (int col = 0; col < 8; col++) {
+				correlationMatrix[(row * 8 + col) * (numElements / 32) + i] = corrMatrix[row * 8 + col];
+			}
+		}
+	}
 }
+
+
+
 
 
 
@@ -200,7 +212,7 @@ __global__ void reduceShfl(int* g_idata, int* g_odata,
 }
 __global__ void initializeArray(int* array) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (idx < N) {
+	if (idx < Global_N) {
 		array[idx] = 1;
 	}
 }
@@ -209,32 +221,42 @@ __global__ void resetInteger(int* value) {
 	*value = 0; // Reset integer value
 }
 
+
+__global__ void intToFloat(int* intMatrix, float* floatMatrix, int size) {
+	int idx = blockDim.x * blockIdx.x + threadIdx.x;
+	if (idx < size) {
+		floatMatrix[idx] = static_cast<float>(intMatrix[idx]);
+	}
+}
+
+// CUDA kernel to initialize the array
+__global__ void initializeArrayKernel(float* array, int size, float value) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < size) {
+		array[idx] = value;
+	}
+}
+
+// Function to initialize the array with 1/N
+extern "C" void initializeArrayWithCuda(float* dev_array, int size, float value) {
+	int blockSize = 256;
+	int numBlocks = (size + blockSize - 1) / blockSize;
+	initializeArrayKernel << <numBlocks, blockSize >> > (dev_array, size, value);
+	cudaDeviceSynchronize();
+}
+
+
 // Helper function for using CUDA.
 extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	unsigned long skip, unsigned long sample_size,
 	__int64 size, int blocks, int threads,
-	int u32LoopCount, int* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2)
+	int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
+	int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors)
 {
 	cudaError_t cudaStatus = cudaSuccess;
 
 	blocks = 48 * 32;
-	threads = 768;
-
-	float elapsedTime1, elapsedTime2, elapsedTime3;
-	cudaEvent_t start, stop, kernel1_start, kernel1_stop, kernel2_start, kernel2_stop, fileWrite_start, fileWrite_stop;
-
-	// Create CUDA events
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-	cudaEventCreate(&kernel1_start);
-	cudaEventCreate(&kernel1_stop);
-	cudaEventCreate(&kernel2_start);
-	cudaEventCreate(&kernel2_stop);
-	cudaEventCreate(&fileWrite_start);
-	cudaEventCreate(&fileWrite_stop);
-
-	// Record the start event
-	cudaEventRecord(start, 0);
+	threads = 768;						// In total 1179648 threads, In total 1000704 segment to work
 
 	int CPUresult = 0; // debug mode
 	int CheckRaw = 0;
@@ -251,32 +273,41 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 		cudaStatus = cudaMemcpy(h_dev_a, a, size * sizeof(short), cudaMemcpyDeviceToHost);
 	}
 
-	// Time for demodulationAt8 kernel
-	cudaEventRecord(kernel1_start, 0);
-	demodulationAt8 << <blocks, threads >> > ((short*)a, size, dev_a);
-	cudaEventRecord(kernel1_stop, 0);
+	// a is dbuffer, size is  u32TransferSizeSamples, cudaMalloc((int**)&dev_a, u32TransferSizeSamples / 48 * sizeof(int));
+	//demodulationAt8 << <blocks, threads >> > ((short*)a, size, dev_a);
+	demodulationCorrelationAt8 << <blocks, threads >> > ((short*)dev_a, size, d_correlationMatrix);
 
-	// Time for reduceShfl kernel
-	cudaEventRecord(kernel2_start, 0);
-	reduceShfl << <blocks, threads >> > (dev_a, d_accTemp2, size / 32);
-	cudaEventRecord(kernel2_stop, 0);
+	// Convert int matrix to float matrix
+	int matrixSize = correlationMatrixSize;
+	int gridSize = (matrixSize + threads - 1) / threads;
+	intToFloat << <gridSize, threads >> > (d_correlationMatrix, d_floatMatrix, matrixSize);
+	
+	// Perform matrix-vector multiplication using cuBLAS
+	float alpha = 1.0f;
+	float beta = 0.0f;
+	cublasStatus_t cublasStatus = cublasSgemv(handle, CUBLAS_OP_N, 64, N, &alpha,
+		d_floatMatrix, 64,
+		d_scaling_factors, 1,
+		&beta, d_averageMatrix, 1);
 
-	cudaMemcpy(h_odata, d_accTemp2, 1 * sizeof(int), cudaMemcpyDeviceToHost);
-	resetInteger << <1, 1 >> > ((int*)d_accTemp2);
+	if (cublasStatus != CUBLAS_STATUS_SUCCESS) {
+		fprintf(stderr, "cublasSgemv failed!");
+		cublasDestroy(handle);
+		cudaFree(d_correlationMatrix);
+		cudaFree(d_floatMatrix);
+		cudaFree(d_averageMatrix);
+		return cudaErrorUnknown;
+	}
+
+
+	//reduceShfl << <blocks, threads >> > (dev_a, d_accTemp2, size / 32);
+	
+
+	//cudaMemcpy(h_odata, d_accTemp2, 1 * sizeof(int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(h_odata, d_averageMatrix, 64 * sizeof(float), cudaMemcpyDeviceToHost);
+	//resetInteger << <1, 1 >> > ((int*)d_accTemp2);
 
 	cudaStatus = cudaDeviceSynchronize();
-
-	// Record the stop event
-	cudaEventRecord(stop, 0);
-	cudaEventSynchronize(stop);
-
-	// Calculate the elapsed times
-	cudaEventElapsedTime(&elapsedTime1, kernel1_start, kernel1_stop);
-	cudaEventElapsedTime(&elapsedTime2, kernel2_start, kernel2_stop);
-	cudaEventElapsedTime(&elapsedTime3, start, stop);
-
-	// Record the start event for file writing
-	cudaEventRecord(fileWrite_start, 0);
 
 	if (CPUresult == 1) {
 		for (int i = 0; i < size / 32; i++) {
@@ -318,46 +349,46 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 		}
 	}
 
+//	if (CheckRaw != 1) {
+//		if (CPUresult == 1) {
+//			if (AnalysisFile == 1) {
+//				fprintf(fptr, "%d\t%d\t%d\n", u32LoopCount, h_accTemp2, h_odata[0]);
+//			}
+//		}
+//		else {
+//			if (AnalysisFile == 1) {
+//				fprintf(fptr, "%d\t%d\n", u32LoopCount, h_odata[0]);
+//			}
+//		}
+//	}
 	if (CheckRaw != 1) {
 		if (CPUresult == 1) {
 			if (AnalysisFile == 1) {
-				fprintf(fptr, "%d\t%d\t%d\n", u32LoopCount, h_accTemp2, h_odata[0]);
+				fprintf(fptr, "%d\t%d\t", u32LoopCount, h_accTemp2);
+				for (int i = 0; i < 64; ++i) {
+					fprintf(fptr, "%f\t", h_odata[i]);
+				}
+				fprintf(fptr, "\n");
 			}
 		}
 		else {
 			if (AnalysisFile == 1) {
-				fprintf(fptr, "%d\t%d\n", u32LoopCount, h_odata[0]);
+				fprintf(fptr, "%d\t", u32LoopCount);
+				for (int i = 0; i < 64; ++i) {
+					fprintf(fptr, "%f\t", h_odata[i]);
+				}
+				fprintf(fptr, "\n");
 			}
 		}
 	}
 
-	// Record the stop event for file writing
-	cudaEventRecord(fileWrite_stop, 0);
-	cudaEventSynchronize(fileWrite_stop);
 
-	// Calculate the elapsed time for file writing
-	float elapsedTimeFileWrite;
-	cudaEventElapsedTime(&elapsedTimeFileWrite, fileWrite_start, fileWrite_stop);
+
 
 	// Close the file if it was opened
 	if (fptr != nullptr) {
 		fclose(fptr);
 	}
-
-	printf("Time for demodulationAt8: %.2f ms\n", elapsedTime1);
-	printf("Time for reduceShfl: %.2f ms\n", elapsedTime2);
-	printf("Total Elapsed Time: %.2f ms\n", elapsedTime3);
-	printf("Time for file writing: %.2f ms\n", elapsedTimeFileWrite);
-
-	// Destroy CUDA events
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
-	cudaEventDestroy(kernel1_start);
-	cudaEventDestroy(kernel1_stop);
-	cudaEventDestroy(kernel2_start);
-	cudaEventDestroy(kernel2_stop);
-	cudaEventDestroy(fileWrite_start);
-	cudaEventDestroy(fileWrite_stop);
 
 	return cudaStatus;
 }

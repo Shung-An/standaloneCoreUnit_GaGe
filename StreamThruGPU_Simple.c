@@ -35,6 +35,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>  // Added
 #include "CsPrototypes.h"
 #include "C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsAppSupport.h"
 #include "C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsSdkMisc.h"
@@ -42,6 +43,8 @@
 #include "CsExpert.h"
 #include <time.h>
 #include <io.h>
+//#include <thrust/device_vector.h>
+#include <cublas_v2.h>
 //#include <pthread.h>
 
 
@@ -53,6 +56,21 @@
 #define STREAM_BUFFERSZIZE	0x200000
 #define STM_SECTION _T("StmConfig")				// section name in ini file
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+	extern cudaError_t GPU_Equation_PlusOne(void* a,
+		unsigned long skip, unsigned long sample_size,
+		__int64 size, int blocks, int threads,
+		int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
+		int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors);
+
+	extern int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length);
+
+#ifdef __cplusplus
+}
+#endif
 
 // User configuration variables
 typedef struct
@@ -103,12 +121,21 @@ DWORD WINAPI CardStreamThread(void* CardIndex);
 BOOL Prepare_Cleanup();
 
 #ifdef __cplusplus
-extern "C" cudaError_t GPU_Equation_PlusOne(void* a, unsigned long skip, unsigned long sample_size, __int64 size, int blocks, int threads);
-extern "C" int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length);
-#else
-extern cudaError_t GPU_Equation_PlusOne(void* a, unsigned long skip, unsigned long sample_size, __int64 size, int blocks, int threads);
-extern int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length);
+extern "C" {
 #endif
+
+extern cudaError_t GPU_Equation_PlusOne(void* a,
+	unsigned long skip, unsigned long sample_size,
+	__int64 size, int blocks, int threads,
+	int u32LoopCount, float* h_odata, short* h_dev_a, short* h_dev_a2, int* dev_a, int* d_accTemp, int* d_accTemp2,
+	int correlationMatrixSize, int N, cublasHandle_t handle, int* d_correlationMatrix, float* d_floatMatrix, float* d_averageMatrix, float* d_scaling_factors);
+extern void initializeArrayWithCuda(float* dev_array, int size, float value);
+extern int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length);
+
+#ifdef __cplusplus
+}
+#endif
+
 
 
 
@@ -122,7 +149,8 @@ void DisplayResults(int stream,
 	uInt32 u32SampleSize,
 	uInt32 u32SkipFactor,
 	double time,
-	char* filename);
+	const char* resultFilename,
+	const char* profileFilename);
 
 void VerifyData(void* buffer, int64 size, unsigned int sample_size);
 
@@ -553,8 +581,10 @@ int _tmain()
 			g_CsAcqCfg.u32SampleSize,
 			g_GpuConfig.u32SkipFactor,
 			dSystemTotalTime,
-			g_GpuConfig.strResultFile);
+			g_GpuConfig.strResultFile,
+			"profile.txt"); // Added profile file name
 	}
+
 
 	return 0;
 }
@@ -695,7 +725,7 @@ void UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes)
 			}
 		}
 		dTotal = 1.0 * llTotaBytes / 1000000.0;		// Mega samples
-		//printf ("\rTotal: %0.2f MB, Rate: %6.2f MB/s, Elapsed time: %u:%02u:%02u  ", dTotal, dRate, h, m, s);
+		printf ("\rTotal: %0.2f MB, Rate: %6.2f MB/s, Elapsed time: %u:%02u:%02u  ", dTotal, dRate, h, m, s);
 	}
 }
 
@@ -871,7 +901,7 @@ cudaError_t InitializeCudaDevice(int32 nDevice, int32* i32MaxBlocks, int32* i32M
 
 DWORD WINAPI CardStreamThread(void* CardIndex)
 {
-	uInt16				nCardIndex = *((uInt16*)CardIndex);
+	uInt16 nCardIndex = *((uInt16*)CardIndex);
 	void* pBuffer1 = NULL;
 	void* pBuffer2 = NULL;
 
@@ -886,8 +916,16 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 	void* pCurrentBuffer = NULL;
 	void* pWorkBuffer = NULL;
-	int* dev_a, * d_accTemp, * d_accTemp2;
+	int* dev_a = NULL;
+	int* d_accTemp = NULL;
+	int* d_accTemp2 = NULL;
+	int* d_correlationMatrix = NULL;
+	float* d_floatMatrix = NULL;
+	float* d_averageMatrix = NULL;
+	float* d_scaling_factors = NULL;
 
+	int					correlationMatrixSize = 0;
+	int					N = 0;		// N is the number of  groups within one segment
 	uInt32				u32TransferSizeSamples = 0;
 	uInt32				u32SectorSize = 256;
 	uInt32				u32DmaBoundary = 16;
@@ -909,7 +947,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	uInt8				u8EndOfData = 0;
 	BOOL				bStreamCompletedSuccess = FALSE;
 	cudaError_t			cudaStatus = 0;
-
+	int					timer = 1;
 
 
 
@@ -917,6 +955,25 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	LARGE_INTEGER temp, start_time = { 0 }, end_time = { 0 };
 	QueryPerformanceFrequency((LARGE_INTEGER*)&temp);
 	double freq = ((double)temp.QuadPart) / 1000.0;
+
+	// Profiling variables
+	LARGE_INTEGER step_start_time, step_end_time, transfer_start_time, transfer_end_time, process_start_time, process_end_time;
+	double step_time, transfer_time, process_time;
+	const char* experimentName = "Experiment_1"; // Change this for different experiments
+	double total_time = 0.0;
+
+	FILE* profileFile = NULL;
+	
+	// Profiling variables
+	if (timer == 1) {
+		profileFile = fopen("profile.txt", "w");
+		if (profileFile == NULL) {
+			fprintf(stderr, "Unable to open profile.txt for writing.\n");
+			ExitThread(1);
+		}
+		fprintf(profileFile, "Experiment: %s\n", experimentName);
+	}
+
 
 	sprintf_s(szSaveFileName, sizeof(szSaveFileName), "%s_%d.dat", g_StreamConfig.strResultFile, nCardIndex);
 
@@ -956,7 +1013,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 	_ftprintf(stderr, _T("\n(Actual buffer size used for data streaming = %u Bytes)\n"), g_StreamConfig.u32BufferSizeBytes);
 
-	i32Status = CsStmAllocateBuffer(g_hSystem, nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer1);			// TODO: Urgent, allocate enough memory of Buffer1
+	i32Status = CsStmAllocateBuffer(g_hSystem, nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer1);			
 	if (CS_FAILED(i32Status))
 	{
 		_ftprintf(stderr, _T("\nUnable to allocate memory for stream buffer 1.\n"));
@@ -1048,32 +1105,85 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		// Convert the transfer size to BYTEs or WORDs depending on the card.
 		u32TransferSizeSamples = g_StreamConfig.u32BufferSizeBytes / g_CsSysInfo.u32SampleSize;
 
-		int* h_odata = (int*)malloc(1 * sizeof(int));
+		// int* h_odata = (int*)malloc(1 * sizeof(int));
+		//int* h_odata = (int*)malloc(32 * sizeof(int));
+		float* h_odata = (float*)malloc(64 * sizeof(float));
 		short* h_dev_a = (short*)malloc(u32TransferSizeSamples * sizeof(short));
 		short* h_dev_a2 = (short*)malloc(u32TransferSizeSamples * sizeof(short));
 		cudaStatus = cudaMalloc((int**)&dev_a, u32TransferSizeSamples / 48 * sizeof(int));
 		cudaStatus = cudaMalloc((void**)&d_accTemp, 1 * sizeof(int));
 		cudaStatus = cudaMalloc((void**)&d_accTemp2, 1 * sizeof(int));
+
+		
+		correlationMatrixSize = (u32TransferSizeSamples / 32) * 64; // the size of correlation matrix for one segment
+		N = u32TransferSizeSamples / 32;		// number of segments, each segment is 32 length
+
+		// Allocate device memory
+		cudaStatus = cudaMalloc((void**)&d_correlationMatrix, correlationMatrixSize * sizeof(int));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed for d_correlationMatrix!");
+			return cudaStatus;
+		}
+
+		cudaStatus = cudaMalloc((void**)&d_floatMatrix, correlationMatrixSize * sizeof(float));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed for d_floatMatrix!");
+			cudaFree(d_correlationMatrix);
+			return cudaStatus;
+		}
+
+		cudaStatus = cudaMalloc((void**)&d_averageMatrix, 64 * sizeof(float));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed for d_averageMatrix!");
+			cudaFree(d_correlationMatrix);
+			cudaFree(d_floatMatrix);
+			return cudaStatus;
+		}
+
+		cudaStatus = cudaMalloc((void**)&d_scaling_factors, N * sizeof(float));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed for d_scaling_factors!");
+			cudaFree(d_correlationMatrix);
+			cudaFree(d_floatMatrix);
+			cudaFree(d_averageMatrix);
+			return cudaStatus;
+		}
+		//thrust::device_vector<float> d_scaling_factors(N, 1.0f / N);
+		// Initialize the array with 1/N
+		float value = 1.0f / N;
+		initializeArrayWithCuda(d_scaling_factors, N, value);
+
+
+		// Create cuBLAS handle
+		cublasHandle_t handle;
+		cublasStatus_t cublasStatus = cublasCreate(&handle);
+		if (cublasStatus != CUBLAS_STATUS_SUCCESS) {
+			fprintf(stderr, "cublasCreate failed!");
+			cudaFree(d_correlationMatrix);
+			cudaFree(d_floatMatrix);
+			cudaFree(d_averageMatrix);
+			return cudaErrorInitializationError;
+		}
+
+
 		FILE* fptr;
 		if (g_StreamConfig.bCascadeResult == 0) fptr = fopen("Analysis.txt", "w");
 		if (g_StreamConfig.bCascadeResult == 1) fptr = fopen("Analysis.txt", "a");
 		fprintf(fptr, "//////\nBuffer size (Samples)\n%d\nSampling Rate (Hz)\n%d\n///\n", u32TransferSizeSamples, g_CsAcqCfg.i64SampleRate);
 		fclose(fptr);
 
-		int timer = 0;
 
 		// Steam acqusition has started.
 		// loop until either we've done the number of segments we want, or
 		// the ESC key was pressed to abort. While we loop, we transfer data into
 		// pCurrentBuffer and save pWorkBuffer to hard disk
 
-		clock_t start_Time, current_time, transfer_start_time, transfer_current_time, step_start_time, step_end_time;
-		double elapsed_time, transfer_time, step_time;
 
 		while (!(bDone || bStreamCompletedSuccess))
 		{	
 			if (timer == 1) {
-				step_start_time = clock();
+				//step_start_time = clock();
+				QueryPerformanceCounter(&step_start_time);
 				}
 			// Check if user has aborted or an error has occured
 			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort, 0))
@@ -1108,7 +1218,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			}
 
 
-			if (timer == 1) transfer_start_time = clock();
+			if (timer == 1) //transfer_start_time = clock();
+			QueryPerformanceCounter(&transfer_start_time);  // Modified
 			i32Status = CsStmTransferToBuffer(g_hSystem, nCardIndex, pCurrentBuffer, u32TransferSizeSamples);
 
 			if (CS_FAILED(i32Status))
@@ -1129,14 +1240,17 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				if (g_GpuConfig.bUseGpu)
 				{
 
-					if (timer == 1) start_Time = clock();
-					cudaStatus = GPU_Equation_PlusOne(d_buffer, g_GpuConfig.u32SkipFactor, g_CsAcqCfg.u32SampleSize, u32TransferSizeSamples, g_GpuConfig.i32GpuBlocks, g_GpuConfig.i32GpuThreads, u32LoopCount, h_odata, h_dev_a, h_dev_a2, dev_a, d_accTemp, d_accTemp2);
+					if (timer == 1) //start_Time = clock();
+					QueryPerformanceCounter(&process_start_time);
+					cudaStatus = GPU_Equation_PlusOne(d_buffer, g_GpuConfig.u32SkipFactor, g_CsAcqCfg.u32SampleSize, u32TransferSizeSamples, g_GpuConfig.i32GpuBlocks, g_GpuConfig.i32GpuThreads, u32LoopCount, h_odata, h_dev_a, h_dev_a2, dev_a, d_accTemp, d_accTemp2, correlationMatrixSize, N, handle, d_correlationMatrix, d_floatMatrix, d_averageMatrix, d_scaling_factors);
 
 
 					if (timer == 1) {
-						current_time = clock();
-						elapsed_time = ((double)(current_time - start_Time)) / CLOCKS_PER_SEC * 1000;
-						printf("Process Time: %.2f ms\n", elapsed_time);
+						//current_time = clock();
+						//elapsed_time = ((double)(current_time - start_Time)) / CLOCKS_PER_SEC * 1000;
+						//printf("Process Time: %.2f ms\n", elapsed_time);
+						QueryPerformanceCounter(&process_end_time);  // Modified
+						process_time = ((double)(process_end_time.QuadPart - process_start_time.QuadPart)) / freq;
 					}
 
 					if (cudaStatus != cudaSuccess)
@@ -1178,9 +1292,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			i32Status = CsStmGetTransferStatus(g_hSystem, nCardIndex, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength, &u8EndOfData);
 
 			if (timer == 1) {
-				transfer_current_time = clock();
-				transfer_time = ((double)(transfer_current_time - transfer_start_time)) / CLOCKS_PER_SEC * 1000;
-				printf("Transfer and Process Time: %.2f ms\n", transfer_time);
+				//transfer_current_time = clock();
+				//transfer_time = ((double)(transfer_current_time - transfer_start_time)) / CLOCKS_PER_SEC * 1000;
+				//printf("Transfer and Process Time: %.2f ms\n", transfer_time);
+				QueryPerformanceCounter(&transfer_end_time);  // Modified
+				transfer_time = ((double)(transfer_end_time.QuadPart - transfer_start_time.QuadPart)) / freq;  // Modified
+
 			}
 
 
@@ -1256,9 +1373,13 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			u32LoopCount++;
 
 			if (timer == 1) {
-				step_end_time = clock();
-				step_time = ((double)(step_end_time - step_start_time)) / CLOCKS_PER_SEC * 1000;
-				printf("One Step Time: %.2f ms\n", step_time);
+				//step_end_time = clock();
+				//step_time = ((double)(step_end_time - step_start_time)) / CLOCKS_PER_SEC * 1000;
+				//printf("One Step Time: %.2f ms\n", step_time);
+				QueryPerformanceCounter(&step_end_time);  // Modified
+				step_time = ((double)(step_end_time.QuadPart - step_start_time.QuadPart)) / freq;  // Modified
+				fprintf(profileFile, "One Step Time: %.2f ms, Transfer and process Time: %.2f ms, GPU Process Time: %.2f ms\n", step_time, transfer_time,  process_time);
+				//printf("\rOne Step Time: %.2f ms, Transfer and process Time: %.2f ms, GPU Process Time: %.2f ms", step_time, transfer_time, process_time);
 			}
 		}
 
@@ -1324,7 +1445,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			// Stream operation has been aborted by user or errors
 			dwRetCode = 1;
 		}
-
+		if (timer == 1) {
+			fclose(profileFile);
+		}
 		ExitThread(dwRetCode);
 	}
 }
@@ -1374,7 +1497,8 @@ void DisplayResults(int stream,
 	uInt32 u32SampleSize,
 	uInt32 u32SkipFactor,
 	double time,
-	char* filename)
+	const char* resultFilename,
+	const char* profileFilename)
 {
 	char s[26];
 	char str[255];
@@ -1385,21 +1509,19 @@ void DisplayResults(int stream,
 	SYSTEMTIME lt;
 	GetLocalTime(&lt);
 
-
-	bFileExists = (-1 == _access(filename, 0)) ? FALSE : TRUE;
+	bFileExists = (-1 == _access(resultFilename, 0)) ? FALSE : TRUE;
 
 	if (bFileExists)
 	{
-		if (-1 == _access(filename, 2) || -1 == _access(filename, 6))
+		if (-1 == _access(resultFilename, 2) || -1 == _access(resultFilename, 6))
 		{
-			printf("\nCannot write to %s\n", filename);
+			printf("\nCannot write to %s\n", resultFilename);
 			bWriteToFile = FALSE;
 		}
 	}
 
 	sprintf_s(szHeader, _countof(szHeader), "\n\nDate\t     Time\tStream\t GPU\tChannels  Records   Samples\t\tBytes\tSkip\tTime (ms)\n\n");
 	printf("%s", szHeader);
-
 
 	sprintf_s(s, _countof(s), "%04d-%02d-%02d  %2d:%2d:%02d", lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond);
 	sprintf_s(str, _countof(str), "%s\t  %d\t  %d\t  %d\t    %d\t    %I64d\t\t %d\t %d\t%.3f\n", s, stream, gpu, u32Mode, u32SegmentCount, i64TransferLength, u32SampleSize, u32SkipFactor, time);
@@ -1408,7 +1530,7 @@ void DisplayResults(int stream,
 
 	if (bWriteToFile)
 	{
-		file = fopen(filename, "a");
+		file = fopen(resultFilename, "a");
 		if (NULL != file)
 		{
 			if (!bFileExists) // first time so write the header
@@ -1418,41 +1540,40 @@ void DisplayResults(int stream,
 			fwrite(str, 1, strlen(str), file);
 			fclose(file);
 		}
+		else
+		{
+			printf("\nFailed to open %s for writing.\n", resultFilename);
+		}
+	}
+
+	// Write to profile file as well
+	bFileExists = (-1 == _access(profileFilename, 0)) ? FALSE : TRUE;
+	bWriteToFile = TRUE;
+	if (bFileExists)
+	{
+		if (-1 == _access(profileFilename, 2) || -1 == _access(profileFilename, 6))
+		{
+			printf("\nCannot write to %s\n", profileFilename);
+			bWriteToFile = FALSE;
+		}
+	}
+
+	if (bWriteToFile)
+	{
+		file = fopen(profileFilename, "a");
+		if (NULL != file)
+		{
+			if (!bFileExists) // first time so write the header
+			{
+				fwrite(szHeader, 1, strlen(szHeader), file);
+			}
+			fwrite(str, 1, strlen(str), file);
+			fclose(file);
+		}
+		else
+		{
+			printf("\nFailed to open %s for writing.\n", profileFilename);
+		}
 	}
 }
 
-/***************************************************************************************************
-****************************************************************************************************/
-
-void VerifyData(void* buffer, int64 size, unsigned int sample_size)
-{
-	// Can be used to print out the first 10 and last 10 samples before and after processing to verfiy the processing
-	printf("\n\n");
-	if (1 == sample_size)
-	{
-		unsigned char* buffer8 = (unsigned char*)buffer;
-		for (int i = 0; i < 10; i++)
-		{
-			printf("%d ", buffer8[i]);
-		}
-		printf(" - ");
-		for (int64 i = (size - 10); i < size; i++)
-		{
-			printf("%d ", buffer8[i]);
-		}
-	}
-	else
-	{
-		short* buffer16 = (short*)buffer;
-		for (int i = 0; i < 10; i++)
-		{
-			printf("%d ", buffer16[i]);
-		}
-		printf(" - ");
-		for (int64 i = (size - 10); i < size; i++)
-		{
-			printf("%d ", buffer16[i]);
-		}
-	}
-	printf("\n");
-}
