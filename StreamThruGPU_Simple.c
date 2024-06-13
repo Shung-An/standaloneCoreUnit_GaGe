@@ -913,7 +913,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	void* d_buffer2 = NULL;
 
 	void* d_buffer = NULL;
-
+	
 	void* pCurrentBuffer = NULL;
 	void* pWorkBuffer = NULL;
 	int* dev_a = NULL;
@@ -948,6 +948,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	BOOL				bStreamCompletedSuccess = FALSE;
 	cudaError_t			cudaStatus = 0;
 	int					timer = 1;
+	int					use_cpu = 0;
 
 
 
@@ -958,7 +959,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 	// Profiling variables
 	LARGE_INTEGER step_start_time, step_end_time, transfer_start_time, transfer_end_time, process_start_time, process_end_time;
-	double step_time, transfer_time, process_time;
+	double step_time = 0; 
+	double transfer_time = 0;
+	double process_time = 0;
 	const char* experimentName = "Experiment_1"; // Change this for different experiments
 	double total_time = 0.0;
 
@@ -1129,7 +1132,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			return cudaStatus;
 		}
 
-		correlationMatrixSize = (u32TransferSizeSamples / 32) * 64; // Size of correlation matrix for one segment
+		correlationMatrixSize = (u32TransferSizeSamples / 32) * 64; // Size of correlation matrix for one data
 		N = u32TransferSizeSamples / 32; // Number of segments, each segment is 32 length
 
 		cudaStatus = cudaMalloc((void**)&d_correlationMatrix, correlationMatrixSize * sizeof(float));
@@ -1226,18 +1229,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			if (u32LoopCount & 1)
 			{
 				pCurrentBuffer = pBuffer2;
-				if (g_GpuConfig.bUseGpu)
-				{
-					d_buffer = d_buffer2;
-				}
 			}
 			else
 			{
 				pCurrentBuffer = pBuffer1;
-				if (g_GpuConfig.bUseGpu)
-				{
-					d_buffer = d_buffer1;
-				}
 			}
 
 			if (g_GpuConfig.bDoAnalysis)
@@ -1262,21 +1257,19 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				break;
 			}
 
-			// do processing here on pWorkBuffer
-			if (g_GpuConfig.bDoAnalysis)
+			// do processing here on dbuffer
+			
+			if (g_GpuConfig.bDoAnalysis && NULL != d_buffer)
 			{
 				if (g_GpuConfig.bUseGpu)
 				{
 
 					if (timer == 1) //start_Time = clock();
-					QueryPerformanceCounter(&process_start_time);
+						QueryPerformanceCounter(&process_start_time);
 					cudaStatus = GPU_Equation_PlusOne(d_buffer, g_GpuConfig.u32SkipFactor, g_CsAcqCfg.u32SampleSize, u32TransferSizeSamples, g_GpuConfig.i32GpuBlocks, g_GpuConfig.i32GpuThreads, u32LoopCount, h_odata, h_dev_a, h_dev_a2, dev_a, d_accTemp, d_accTemp2, correlationMatrixSize, N, handle, d_correlationMatrix, d_floatMatrix, d_averageMatrix, d_scaling_factors);
 
 
 					if (timer == 1) {
-						//current_time = clock();
-						//elapsed_time = ((double)(current_time - start_Time)) / CLOCKS_PER_SEC * 1000;
-						//printf("Process Time: %.2f ms\n", elapsed_time);
 						QueryPerformanceCounter(&process_end_time);  // Modified
 						process_time = ((double)(process_end_time.QuadPart - process_start_time.QuadPart)) / freq;
 					}
@@ -1288,9 +1281,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						break;
 					}
 				}
-				else // use CPU
+
+				if (use_cpu == 1 && NULL != pWorkBuffer ) // use CPU
 				{
-					i32Status = CPU_Equation_PlusOne(pCurrentBuffer, g_CsAcqCfg.u32SampleSize, 0, u32TransferSizeSamples);
+					i32Status = CPU_Equation_PlusOne(pWorkBuffer, g_CsAcqCfg.u32SampleSize, 0, u32TransferSizeSamples);
 
 					if (CS_FAILED(i32Status))
 					{
@@ -1300,6 +1294,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					}
 				}
 			}
+			
 
 
 			if (g_StreamConfig.bSaveToFile && NULL != pWorkBuffer)
@@ -1396,18 +1391,26 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				QueryPerformanceCounter((LARGE_INTEGER*)&end_time);
 				diff_time[nCardIndex - 1] += ((double)end_time.QuadPart - (double)start_time.QuadPart) / freq;
 			}
+
+
+
 			pWorkBuffer = pCurrentBuffer;
+
+			if (pCurrentBuffer == pBuffer1) {
+				d_buffer = d_buffer1;
+			}
+
+			else {
+				d_buffer = d_buffer2;
+			}
 
 			u32LoopCount++;
 
+
 			if (timer == 1) {
-				//step_end_time = clock();
-				//step_time = ((double)(step_end_time - step_start_time)) / CLOCKS_PER_SEC * 1000;
-				//printf("One Step Time: %.2f ms\n", step_time);
-				QueryPerformanceCounter(&step_end_time);  // Modified
-				step_time = ((double)(step_end_time.QuadPart - step_start_time.QuadPart)) / freq;  // Modified
-				fprintf(profileFile, "One Step Time: %.2f ms, Transfer and process Time: %.2f ms, GPU Process Time: %.2f ms\n", step_time, transfer_time,  process_time);
-				//printf("\rOne Step Time: %.2f ms, Transfer and process Time: %.2f ms, GPU Process Time: %.2f ms", step_time, transfer_time, process_time);
+				QueryPerformanceCounter(&step_end_time);  
+				step_time = ((double)(step_end_time.QuadPart - step_start_time.QuadPart)) / freq;  
+				fprintf(profileFile, "One Step Time: %.2f ms, Transfer and process Time: %.2f ms, GPU Process Time: %.2f ms\n", step_time, transfer_time, process_time);
 			}
 		}
 

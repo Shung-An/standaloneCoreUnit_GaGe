@@ -7,6 +7,7 @@
 #include <time.h>
 #include <thrust/device_vector.h>
 #include <cublas_v2.h>
+#include <iostream>
 
 #define DIM 768
 
@@ -112,19 +113,19 @@ __global__ void demodulationAt12(short* a, __int64 numElements, int* out)
 
 }
 
-__global__ void demodulationCorrelationAt8(short* a, __int64 numElements, int* correlationMatrix) {
+__global__ void demodulationCorrelationAt8(short* a, __int64 numElements, float* correlationMatrix) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = index; i < numElements / 32; i += stride) {
 		// Arrays potentially stored in registers if there are enough registers available
-		int segment[32];  // 128 bytes
+		float segment[32];  // 128 bytes
 
 		// Initialize the segment array
 		#pragma unroll
 		for (int j = 0; j < 32; j++) {
 			if (i * 32 + j < numElements) {
-				segment[j] = static_cast<int>(a[i * 32 + j]);
+				segment[j] = static_cast<float>(a[i * 32 + j]);
 			}
 			else {
 				segment[j] = 0;  // Handle out-of-bound access gracefully
@@ -138,10 +139,10 @@ __global__ void demodulationCorrelationAt8(short* a, __int64 numElements, int* c
 		for (int row = 0; row < 8; row++) {
 		#pragma unroll
 			for (int col = 0; col < 8; col++) {
-				int value1 = segment[row * 2];
-				int value2 = segment[(row + 8) * 2];
-				int value3 = segment[col * 2 + 1];
-				int value4 = segment[(col + 8) * 2 + 1];
+				float value1 = segment[row * 2];
+				float value2 = segment[(row + 8) * 2];
+				float value3 = segment[col * 2 + 1];
+				float value4 = segment[(col + 8) * 2 + 1];
 				corrMatrix[row * 8 + col] = (value1 - value2) * (value3 - value4);
 			}
 		}
@@ -192,10 +193,82 @@ __global__ void demodulationCorrelationAt8Light(short* a, __int64 numElements, f
 
 		float corrValue = (value1 - value2) * (value3 - value4);
 
-		correlationMatrix[elementIndex * matrixSize + segmentIndex] = corrValue;				// Correlation matrix, one column is a single correlation matrix
+		//correlationMatrix[elementIndex * matrixSize + segmentIndex] = corrValue;				//Store the correlation matrix in row-major order
+		// Store the correlation matrix in column-major order
+		correlationMatrix[segmentIndex * 64 + elementIndex] = corrValue; // Correlation matrix, one column is a single correlation matrix
 	}
 }
 
+__global__ void demodulationCorrelationAt8Light_block(short* a, __int64 numElements, float* correlationMatrix, int block_size) {
+	int index = blockDim.x * blockIdx.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+
+	int numSegmentsPerBlock = block_size / 64;
+	int segmentIndexInBlock = threadIdx.x / 64;
+	int segmentIndex = index / 64;
+	int elementIndex = threadIdx.x % 64;
+
+	// Declare shared memory
+	extern __shared__ float sharedSegment[];
+
+	// Each segment has 32 elements
+	float* segmentPtr = sharedSegment + segmentIndexInBlock * 32;
+
+	// Load data into shared memory
+	if (threadIdx.x < numSegmentsPerBlock * 32) {
+		int segmentThreadIdx = threadIdx.x % 32;
+		if (segmentIndex * 32 + segmentThreadIdx < numElements) {
+			segmentPtr[segmentThreadIdx] = static_cast<float>(a[segmentIndex * 32 + segmentThreadIdx]);
+		}
+		else {
+			segmentPtr[segmentThreadIdx] = 0.0f; // Handle out-of-bound access gracefully
+		}
+	}
+
+	__syncthreads(); // Ensure all threads have loaded their data into shared memory
+
+	if (segmentIndex < numElements / 32) {
+		int row = elementIndex / 8;
+		int col = elementIndex % 8;
+
+		float value1 = segmentPtr[row * 2];
+		float value2 = segmentPtr[(row + 8) * 2];
+		float value3 = segmentPtr[col * 2 + 1];
+		float value4 = segmentPtr[(col + 8) * 2 + 1];
+
+		float corrValue = (value1 - value2) * (value3 - value4);
+
+		correlationMatrix[elementIndex * (numElements / 32) + segmentIndex] = corrValue; // Correlation matrix, one column is a single correlation matrix
+	}
+}
+
+
+__global__ void demodulationCorrelationAt8NoShared(short* a, __int64 numElements, float* correlationMatrix) {
+	int index = blockDim.x * blockIdx.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+
+	int matrixSize = numElements / 32; // the number of matrices that will be generated or the number of segments
+	int elementIndex = index % 64; // Each thread works on one element of the 8x8 correlation matrix
+	int segmentIndex = index / 64; // Determines which 32-element segment we're working on
+
+	if (segmentIndex < matrixSize) {
+		int row = elementIndex / 8;
+		int col = elementIndex % 8;
+
+		// Directly read from global memory
+		int segmentStart = segmentIndex * 32;
+		float value1 = static_cast<float>(a[segmentStart + row * 2]);
+		float value2 = static_cast<float>(a[segmentStart + (row + 8) * 2]);
+		float value3 = static_cast<float>(a[segmentStart + col * 2 + 1]);
+		float value4 = static_cast<float>(a[segmentStart + (col + 8) * 2 + 1]);
+
+		float corrValue = (value1 - value2) * (value3 - value4);
+
+		//correlationMatrix[elementIndex * matrixSize + segmentIndex] = corrValue; // Correlation matrix, one column is a single correlation matrix
+		// Store the correlation matrix in column-major order
+		correlationMatrix[segmentIndex * 64 + elementIndex] = corrValue; // Correlation matrix, one column is a single correlation matrix
+	}
+}
 
 
 
@@ -290,11 +363,9 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 {
 	cudaError_t cudaStatus = cudaSuccess;
 
-	//blocks = 48 * 32;
-	//threads = 768;						// In total 1179648 threads, In total 1000704 segment to work
-
+	
 	// Kernel launch configuration
-	int blockSize = 64; // You can experiment with this value
+	int blockSize = 256;
 	int totalThreads = (size / 32) * 64;
 	int gridSize = (totalThreads + blockSize - 1) / blockSize;
 
@@ -309,18 +380,14 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 		fptr = fopen("Analysis.txt", "a");
 	}
 
-	if (CPUresult == 1) {
-		cudaStatus = cudaMemcpy(h_dev_a, a, size * sizeof(short), cudaMemcpyDeviceToHost);
-	}
 
-	// a is dbuffer, size is  u32TransferSizeSamples, cudaMalloc((int**)&dev_a, u32TransferSizeSamples / 48 * sizeof(int));
 	//demodulationAt8 << <blocks, threads >> > ((short*)a, size, dev_a);
-	demodulationCorrelationAt8Light <<<gridSize, blockSize>>> ((short*)a, size, d_correlationMatrix);
+	//demodulationCorrelationAt8 <<<gridSize, blockSize>>> ((short*)a, size, d_correlationMatrix);
+	//demodulationCorrelationAt8Light <<<gridSize, blockSize>>> ((short*)a, size, d_correlationMatrix);
+	//demodulationCorrelationAt8Light_block << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, blockSize);
+	demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix);
 
-	// Convert int matrix to float matrix
-	//int matrixSize = correlationMatrixSize;
-	//gridSize = (matrixSize + blockSize - 1) / blockSize;
-	//intToFloat <<<gridSize, blockSize >>> (d_correlationMatrix, d_floatMatrix, matrixSize);
+	
 	
 	// Perform matrix-vector multiplication using cuBLAS
 	float alpha = 1.0f;
@@ -340,90 +407,18 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	}
 
 
-	//reduceShfl << <blocks, threads >> > (dev_a, d_accTemp2, size / 32);
-	
-
-	//cudaMemcpy(h_odata, d_accTemp2, 1 * sizeof(int), cudaMemcpyDeviceToHost);
 	cudaMemcpy(h_odata, d_averageMatrix, 64 * sizeof(float), cudaMemcpyDeviceToHost);
-	//resetInteger << <1, 1 >> > ((int*)d_accTemp2);
 
 	cudaStatus = cudaDeviceSynchronize();
 
-	if (CPUresult == 1) {
-		for (int i = 0; i < size / 32; i++) {
-			int a1 = h_dev_a[i * 32];
-			int a2 = h_dev_a[i * 32 + 1];
-			int a3 = h_dev_a[i * 32 + 2];
-			int a4 = h_dev_a[i * 32 + 3];
-			int a5 = h_dev_a[i * 32 + 4];
-			int a6 = h_dev_a[i * 32 + 5];
-			int a7 = h_dev_a[i * 32 + 6];
-			int a8 = h_dev_a[i * 32 + 7];
-			int a9 = h_dev_a[i * 32 + 8];
-			int a10 = h_dev_a[i * 32 + 9];
-			int a11 = h_dev_a[i * 32 + 10];
-			int a12 = h_dev_a[i * 32 + 11];
-			int a13 = h_dev_a[i * 32 + 12];
-			int a14 = h_dev_a[i * 32 + 13];
-			int a15 = h_dev_a[i * 32 + 14];
-			int a16 = h_dev_a[i * 32 + 15];
-			int a17 = h_dev_a[i * 32 + 16];
-			int a18 = h_dev_a[i * 32 + 17];
-			int a19 = h_dev_a[i * 32 + 18];
-			int a20 = h_dev_a[i * 32 + 19];
-			int a21 = h_dev_a[i * 32 + 20];
-			int a22 = h_dev_a[i * 32 + 21];
-			int a23 = h_dev_a[i * 32 + 22];
-			int a24 = h_dev_a[i * 32 + 23];
-			int a25 = h_dev_a[i * 32 + 24];
-			int a26 = h_dev_a[i * 32 + 25];
-			int a27 = h_dev_a[i * 32 + 26];
-			int a28 = h_dev_a[i * 32 + 27];
-			int a29 = h_dev_a[i * 32 + 28];
-			int a30 = h_dev_a[i * 32 + 29];
-			int a31 = h_dev_a[i * 32 + 30];
-			int a32 = h_dev_a[i * 32 + 31];
-			int temp = 0;
-			temp = (a17 - a1) * (a2 - a18) + (a19 - a3) * (a4 - a20) + (a5 - a21) * (a6 - a22) + (a7 - a23) * (a8 - a24) + (a9 - a25) * (a10 - a26) + (a11 - a27) * (a12 - a28) + (a29 - a13) * (a14 - a30) + (a31 - a15) * (a16 - a32);
-			h_accTemp2 += temp;
+	if (AnalysisFile == 1) {
+		fprintf(fptr, "%d\t", u32LoopCount);
+		for (int i = 0; i < 64; ++i) {
+			fprintf(fptr, "%f\t", h_odata[i]);
 		}
+		fprintf(fptr, "\n");
 	}
-
-//	if (CheckRaw != 1) {
-//		if (CPUresult == 1) {
-//			if (AnalysisFile == 1) {
-//				fprintf(fptr, "%d\t%d\t%d\n", u32LoopCount, h_accTemp2, h_odata[0]);
-//			}
-//		}
-//		else {
-//			if (AnalysisFile == 1) {
-//				fprintf(fptr, "%d\t%d\n", u32LoopCount, h_odata[0]);
-//			}
-//		}
-//	}
-	if (CheckRaw != 1) {
-		if (CPUresult == 1) {
-			if (AnalysisFile == 1) {
-				fprintf(fptr, "%d\t%d\t", u32LoopCount, h_accTemp2);
-				for (int i = 0; i < 64; ++i) {
-					fprintf(fptr, "%f\t", h_odata[i]);
-				}
-				fprintf(fptr, "\n");
-			}
-		}
-		else {
-			if (AnalysisFile == 1) {
-				fprintf(fptr, "%d\t", u32LoopCount);
-				for (int i = 0; i < 64; ++i) {
-					fprintf(fptr, "%f\t", h_odata[i]);
-				}
-				fprintf(fptr, "\n");
-			}
-		}
-	}
-
-
-
+	
 
 	// Close the file if it was opened
 	if (fptr != nullptr) {
