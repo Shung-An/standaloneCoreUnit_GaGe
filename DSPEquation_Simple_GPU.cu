@@ -76,7 +76,7 @@ __global__ void demodulationCorrelationAt8(short* a, __int64 numElements, double
 }
 
 
-// Demodulation at 8 correlation matrix with shared memory
+// Demodulation at 8 correlation matrix with shared memory, light version
 __global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, double* correlationMatrix) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
@@ -120,7 +120,7 @@ __global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, 
 
 
 
-// Demodulation at 8 correlation matrix without shared memory
+// Demodulation at 8 correlation matrix without shared memory, light version
 __global__ void demodulationCorrelationAt8NoShared(short* a, __int64 numElements, double* correlationMatrix) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;

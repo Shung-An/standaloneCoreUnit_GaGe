@@ -43,9 +43,8 @@
 #include "CsExpert.h"
 #include <time.h>
 #include <io.h>
-//#include <thrust/device_vector.h>
 #include <cublas_v2.h>
-//#include <pthread.h>
+
 
 
 #define	MAX_CARDS_COUNT			10				// Max number of cards supported in a M/S Compuscope system 
@@ -767,8 +766,7 @@ int32 LoadStmConfiguration(LPCTSTR szIniFile, PCSSTMCONFIG pConfig)
 
 	nDummy = 0;
 	CsStmCfg.bErrorHandling = (0 != GetPrivateProfileInt(STM_SECTION, _T("ErrorHandlingMode"), nDummy, szFilePath));
-	//CsStmCfg.bErrorHandling = 1;
-	//da
+
 	nDummy = 0;
 	CsStmCfg.bCascadeResult = (0 != GetPrivateProfileInt(STM_SECTION, _T("CascadeResult"), nDummy, szFilePath));
 
