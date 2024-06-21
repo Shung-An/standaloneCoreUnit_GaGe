@@ -184,9 +184,9 @@ __global__ void averageMatrixKernel(double* averageMatrix, int N) {
 extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	__int64 size, int blocks, int threads,
 	int u32LoopCount, double* h_odata,
-	int N, cublasHandle_t handle, double* d_correlationMatrix, double* d_averageMatrix, double* d_scaling_factors)
+	int N, cublasHandle_t handle, double* d_correlationMatrix, double* d_averageMatrix, double* d_scaling_factors, 
+	FILE * binFile, FILE * AnalysisFile)
 {
-	int AnalysisFile = 1;		// Enable writing to file
 	cudaError_t cudaStatus = cudaSuccess; // Return status of CUDA functions
 
 	// Kernel launch configuration
@@ -194,17 +194,6 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	int totalThreads = (size / 32) * 64; // Total number of threads
 	int gridSize = (totalThreads + blockSize - 1) / blockSize; // Number of blocks
 	
-
-	FILE* fptr = nullptr;	// File pointer for writing to file
-
-	// Open file for writing if enabled
-	if (AnalysisFile == 1) {
-		fptr = fopen("Analysis.txt", "a");
-		if (fptr == nullptr) {
-			printf("Error opening file!\n");
-			return cudaErrorFileNotFound;
-		}
-	}
 
 	// Demodulation at 8 for correlation matrix
 	demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix); 
@@ -234,14 +223,18 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	// Wait for the GPU to finish
 	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
 	 
-	// Write results to file if enabled
-	if (fptr) {
-		fprintf(fptr, "%d\t", u32LoopCount);
+	// Write results to Analysis file
+	if (AnalysisFile) {
+		fprintf(AnalysisFile, "%d\t", u32LoopCount);
 		for (int i = 0; i < 64; ++i) {
-			fprintf(fptr, "%.10f\t", h_odata[i]);
+			fprintf(AnalysisFile, "%.10f\t", h_odata[i]);
 		}
-		fprintf(fptr, "\n");
-		fclose(fptr);
+		fprintf(AnalysisFile, "\n");
+	}
+
+	// Write results to binary file for Matlab use
+	if (binFile) {
+		fwrite(h_odata, sizeof(double), 64, binFile);
 	}
 
 	return cudaStatus;

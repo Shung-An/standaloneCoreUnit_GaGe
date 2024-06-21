@@ -100,7 +100,7 @@ uInt32 CalculateTriggerCountFromConfig(CSSYSTEMINFO* pCsSysInfo, const LPCTSTR s
 BOOL isChannelValid(uInt32 u32ChannelIndex, uInt32 u32mode, uInt16 u16cardIndex, CSSYSTEMINFO* pCsSysInfo);
 uInt32 GetSectorSize();
 
-void  UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes);
+void  UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes, FILE* AnalysisFile);
 int32 LoadStmConfiguration(LPCTSTR szIniFile, PCSSTMCONFIG pConfig);
 DWORD WINAPI CardStreamThread(void* CardIndex);
 BOOL Prepare_Cleanup();
@@ -112,7 +112,8 @@ extern "C" {
 extern cudaError_t GPU_Equation_PlusOne(void* a,
 		__int64 size, int blocks, int threads,
 		int u32LoopCount, double* h_odata,
-		int N, cublasHandle_t handle, double* d_correlationMatrix, double* d_averageMatrix, double* d_scaling_factors);
+		int N, cublasHandle_t handle, double* d_correlationMatrix, double* d_averageMatrix, double* d_scaling_factors,
+		FILE* binFile, FILE* AnalysisFile);
 
 extern void initializeArrayWithCuda(double* dev_array, int size, double value);
 extern int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length, double* gpu_average_matrix);
@@ -505,7 +506,7 @@ int _tmain()
 			llSystemTotalData += g_llCardTotalData[i];
 		}
 
-		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize);
+		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize, NULL);
 	}
 
 	//	Abort the current acquisition 
@@ -571,6 +572,9 @@ int _tmain()
 				g_GpuConfig.strResultFile,
 				"profile.txt"); // Added profile file name
 		}
+
+		FILE* AnalysisFile = fopen("Analysis.txt", "a");
+		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData* g_CsSysInfo.u32SampleSize, AnalysisFile);
 	}
 
 
@@ -688,7 +692,7 @@ int32 InitializeStream(CSHANDLE hSystem)
 /***************************************************************************************************
 ****************************************************************************************************/
 
-void UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes)
+void UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes, FILE* AnalysisFile)
 {
 	uInt32	h = 0;
 	uInt32	m = 0;
@@ -714,6 +718,11 @@ void UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes)
 		}
 		dTotal = 1.0 * llTotaBytes / 1000000.0;		// Mega samples
 		printf ("\rTotal: %0.2f MB, Rate: %6.2f MB/s, Elapsed time: %u:%02u:%02u  ", dTotal, dRate, h, m, s);
+
+		if (AnalysisFile != NULL)
+		{
+			fprintf(AnalysisFile, "\rTotal: %0.2f MB, Rate: %6.2f MB/s, Elapsed time: %u:%02u:%02u  ", dTotal, dRate, h, m, s);
+		}
 	}
 }
 
@@ -1085,6 +1094,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			{
 				cudaHostUnregister(h_buffer1);
 				cudaHostUnregister(h_buffer2);
+
 			}
 			DeleteFile(szSaveFileName);
 			ExitThread(1);
@@ -1145,6 +1155,19 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		fprintf(fptr, "//////\nBuffer size (Samples)\n%d\nSampling Rate (Hz)\n%d\n///\n", u32TransferSizeSamples, g_CsAcqCfg.i64SampleRate);
 		fclose(fptr);
 
+
+		// Open the binary file for writing
+		FILE* binFile = fopen("cm.bin", "wb");
+		if (binFile == NULL) {
+			printf("Error opening file for writing\n");
+			return 1;
+		}
+
+		FILE* AnalysisFile = fopen("Analysis.txt", "a");
+		if (AnalysisFile == NULL) {
+			printf("Error opening file for writing\n");
+			return 1;
+		}
 
 		// Steam acqusition has started.
 		// loop until either we've done the number of segments we want, or
@@ -1215,7 +1238,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					cudaStatus = GPU_Equation_PlusOne(d_buffer,
 													  u32TransferSizeSamples, g_GpuConfig.i32GpuBlocks, g_GpuConfig.i32GpuThreads, 
 													  u32LoopCount, h_odata, 
-													  N, CUhandle, d_correlationMatrix, d_averageMatrix, d_scaling_factors);
+													  N, CUhandle, d_correlationMatrix, d_averageMatrix, d_scaling_factors,
+													  binFile, AnalysisFile);
 					
 					
 
@@ -1413,6 +1437,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		cudaFree(d_correlationMatrix);
 		cudaFree(d_averageMatrix);
 		cudaFree(d_scaling_factors);
+		
 
 
 
@@ -1428,6 +1453,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (timer == 1) {
 			fclose(profileFile);
 		}
+		
+		// Close the binary file, and the analysis file
+		fclose(binFile);
+		fclose(AnalysisFile);
+
 		ExitThread(dwRetCode);
 	}
 }
