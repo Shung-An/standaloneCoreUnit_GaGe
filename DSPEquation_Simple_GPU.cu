@@ -77,26 +77,19 @@ __global__ void demodulationCorrelationAt8(short* a, __int64 numElements, double
 
 
 // Demodulation at 8 correlation matrix with shared memory, light version
-__global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, double* correlationMatrix) {
+__global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, double* correlationMatrix, const int sharedSegmentSize) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
 
 	int matrixSize = numElements / 32; // the number of matrices will generate or the number of segments
 	int elementIndex = index % 64; // Each thread works on one element of the 8x8 correlation matrix
 	int segmentIndex = index / 64; // Determines which 32-element segment we're working on
-
 	// Declare shared memory
-	__shared__ float sharedSegment[32];
+	__shared__ float sharedSegment[128]; // 512 bytes
 
 	// Only the first 32 threads in the block load data into shared memory
-	if (threadIdx.x < 32) {
-		int segmentThreadIdx = threadIdx.x;
-		if (segmentIndex * 32 + segmentThreadIdx < numElements) {
-			sharedSegment[segmentThreadIdx] = static_cast<float>(a[segmentIndex * 32 + segmentThreadIdx]);
-		}
-		else {
-			sharedSegment[segmentThreadIdx] = 0.0f; // Handle out-of-bound access gracefully
-		}
+	if (threadIdx.x < sharedSegmentSize) {
+		sharedSegment[threadIdx.x] = static_cast<float>(a[blockIdx.x * sharedSegmentSize + threadIdx.x]);
 	}
 
 	__syncthreads(); // Ensure all threads have loaded their data into shared memory
@@ -105,10 +98,12 @@ __global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, 
 		int row = elementIndex / 8;
 		int col = elementIndex % 8;
 
-		float value1 = sharedSegment[row * 2];
-		float value2 = sharedSegment[(row + 8) * 2];
-		float value3 = sharedSegment[col * 2 + 1];
-		float value4 = sharedSegment[(col + 8) * 2 + 1];
+		int segmentStart = threadIdx.x / 64 * 32; // Determine the starting index of the segment in shared memory
+
+		float value1 = sharedSegment[segmentStart + row * 2];
+		float value2 = sharedSegment[segmentStart + (row + 8) * 2];
+		float value3 = sharedSegment[segmentStart + col * 2 + 1];
+		float value4 = sharedSegment[segmentStart + (col + 8) * 2 + 1];
 
 		double corrValue = (value1 - value2) * (value3 - value4);
 
@@ -196,7 +191,10 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	
 
 	// Demodulation at 8 for correlation matrix
-	demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix); 
+	//demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix); 
+
+	// Demodulation at 8 for correlation matrix with shared memory
+	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, 128);
 
 
 	// Perform matrix-vector multiplication using cuBLAS
