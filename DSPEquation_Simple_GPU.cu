@@ -191,9 +191,9 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 
 	// Demodulation at 8 for correlation matrix
 	//demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix); 
-
+	int sharedSegmentSize = 128;
 	// Demodulation at 8 for correlation matrix with shared memory
-	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, 128, totalThreads);
+	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, sharedSegmentSize, totalThreads);
 
 
 	// Perform matrix-vector multiplication using cuBLAS
