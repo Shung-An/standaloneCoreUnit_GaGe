@@ -48,7 +48,7 @@ int compareMatrices(double* matrix1, double* matrix2, int size, double tolerance
 
 
 // Function to compute the average correlation matrix
-int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length, double* gpu_average_matrix) {
+int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matrix) {
     // Number of elements in the buffer
     __int64 numElements = length;
     int numSegments = numElements / 32;
@@ -67,7 +67,7 @@ int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start,
 
     // Compute correlation matrices for each segment
     for (int i = 0; i < numSegments; i++) {
-        computeCorrelationMatrix(&inputArray[start + i * 32], &correlationMatrices[i * 64]);
+        computeCorrelationMatrix(&inputArray[i * 32], &correlationMatrices[i * 64]);
     }
 
   
@@ -96,6 +96,7 @@ int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start,
         }
     }
     fprintf(fptr, "\n");
+
 
 	// Write the result of the comparison to the file
     if (gpu_correct) {

@@ -77,13 +77,12 @@ __global__ void demodulationCorrelationAt8(short* a, __int64 numElements, double
 
 
 // Demodulation at 8 correlation matrix with shared memory, light version
-__global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, double* correlationMatrix, const int sharedSegmentSize) {
+__global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, double* correlationMatrix, const int sharedSegmentSize, const int totalThreads) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
-	int stride = blockDim.x * gridDim.x;
+	
 
-	int matrixSize = numElements / 32; // the number of matrices will generate or the number of segments
-	int elementIndex = index % 64; // Each thread works on one element of the 8x8 correlation matrix
-	int segmentIndex = index / 64; // Determines which 32-element segment we're working on
+	//int elementIndex = index % 64; // Each thread works on one element of the 8x8 correlation matrix
+	//int segmentIndex = index / 64; // Determines which 32-element segment we're working on
 	// Declare shared memory
 	__shared__ float sharedSegment[128]; // 512 bytes
 
@@ -94,9 +93,9 @@ __global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, 
 
 	__syncthreads(); // Ensure all threads have loaded their data into shared memory
 
-	if (segmentIndex < matrixSize) {
-		int row = elementIndex / 8;
-		int col = elementIndex % 8;
+	if (index < totalThreads) {
+		int row = index % 64 / 8;
+		int col = index % 8;
 
 		int segmentStart = threadIdx.x / 64 * 32; // Determine the starting index of the segment in shared memory
 
@@ -109,7 +108,7 @@ __global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, 
 
 		//correlationMatrix[elementIndex * matrixSize + segmentIndex] = corrValue;				//Store the correlation matrix in row-major order
 		// Store the correlation matrix in column-major order
-		correlationMatrix[segmentIndex * 64 + elementIndex] = corrValue; // Correlation matrix, one column is a single correlation matrix
+		correlationMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix
 	}
 }
 
@@ -194,7 +193,7 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	//demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix); 
 
 	// Demodulation at 8 for correlation matrix with shared memory
-	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, 128);
+	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, 128, totalThreads);
 
 
 	// Perform matrix-vector multiplication using cuBLAS

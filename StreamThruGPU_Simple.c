@@ -116,7 +116,7 @@ extern cudaError_t GPU_Equation_PlusOne(void* a,
 		FILE* binFile, FILE* AnalysisFile);
 
 extern void initializeArrayWithCuda(double* dev_array, int size, double value);
-extern int CPU_Equation_PlusOne(void* buffer, unsigned long sample_size, __int64 start, __int64 length, double* gpu_average_matrix);
+extern int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matrix);
 
 #ifdef __cplusplus
 }
@@ -1258,7 +1258,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 				if (use_cpu == 1 && NULL != pWorkBuffer) // use CPU for verify the correctness of the GPU Calculation
 				{
-					i32Status = CPU_Equation_PlusOne(pWorkBuffer, g_CsAcqCfg.u32SampleSize, 0, u32TransferSizeSamples, h_odata);
+					i32Status = CPU_Equation_PlusOne(pWorkBuffer, u32TransferSizeSamples, h_odata);
 
 					if (CS_FAILED(i32Status))
 					{
