@@ -77,45 +77,49 @@ __global__ void demodulationCorrelationAt8(short* a, __int64 numElements, double
 
 
 // Demodulation at 8 correlation matrix with shared memory, light version
-__global__ void demodulationCorrelationAt8Shared(short* a, __int64 numElements, double* correlationMatrix, const int sharedSegmentSize, const int totalThreads) {
+__global__ void demodulationCorrelationAt8Shared(short* data, 
+												__int64 numElements, 
+												double* aggregatedCorrMatrix, 
+												const int sharedSegmentSize, 
+												const int totalThreads,
+												const int demodulationWindowSize, 
+												const int corrMatrixSize, 
+												const int segmentSize) 
+{
+	
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	
-
-	//int elementIndex = index % 64; // Each thread works on one element of the 8x8 correlation matrix
-	//int segmentIndex = index / 64; // Determines which 32-element segment we're working on
 	// Declare shared memory
-	__shared__ float sharedSegment[128]; // 512 bytes
-
-	// Only the first 32 threads in the block load data into shared memory
+	//__shared__ float sharedSegment[sharedSegmentSize]; 
+	extern __shared__ float sharedSegment[];
+	// load data into shared memory
 	if (threadIdx.x < sharedSegmentSize) {
-		sharedSegment[threadIdx.x] = static_cast<float>(a[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		sharedSegment[threadIdx.x] = static_cast<float>(data[blockIdx.x * sharedSegmentSize + threadIdx.x]);
 	}
 
 	__syncthreads(); // Ensure all threads have loaded their data into shared memory
 
 	if (index < totalThreads) {
-		int row = index % 64 / 8;
-		int col = index % 8;
+		int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
+		int col = threadIdx.x % demodulationWindowSize;
 
-		int segmentStart = threadIdx.x / 64 * 32; // Determine the starting index of the segment in shared memory
+		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
 
 		float value1 = sharedSegment[segmentStart + row * 2];
-		float value2 = sharedSegment[segmentStart + (row + 8) * 2];
+		float value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) * 2];
 		float value3 = sharedSegment[segmentStart + col * 2 + 1];
-		float value4 = sharedSegment[segmentStart + (col + 8) * 2 + 1];
+		float value4 = sharedSegment[segmentStart + (col + demodulationWindowSize) * 2 + 1];
 
 		double corrValue = (value1 - value2) * (value3 - value4);
 
-		//correlationMatrix[elementIndex * matrixSize + segmentIndex] = corrValue;				//Store the correlation matrix in row-major order
-		// Store the correlation matrix in column-major order
-		correlationMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix
+		aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
 	}
 }
 
 
 
 // Demodulation at 8 correlation matrix without shared memory, light version
-__global__ void demodulationCorrelationAt8NoShared(short* a, __int64 numElements, double* correlationMatrix) {
+__global__ void demodulationCorrelationAt8NoShared(short* data, __int64 numElements, double* correlationMatrix) {
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
 
@@ -129,10 +133,10 @@ __global__ void demodulationCorrelationAt8NoShared(short* a, __int64 numElements
 
 		// Directly read from global memory
 		int segmentStart = segmentIndex * 32;
-		float value1 = static_cast<float>(a[segmentStart + row * 2]);
-		float value2 = static_cast<float>(a[segmentStart + (row + 8) * 2]);
-		float value3 = static_cast<float>(a[segmentStart + col * 2 + 1]);
-		float value4 = static_cast<float>(a[segmentStart + (col + 8) * 2 + 1]);
+		float value1 = static_cast<float>(data[segmentStart + row * 2]);
+		float value2 = static_cast<float>(data[segmentStart + (row + 8) * 2]);
+		float value3 = static_cast<float>(data[segmentStart + col * 2 + 1]);
+		float value4 = static_cast<float>(data[segmentStart + (col + 8) * 2 + 1]);
 
 		double corrValue = (value1 - value2) * (value3 - value4);
 		
@@ -175,47 +179,51 @@ __global__ void averageMatrixKernel(double* averageMatrix, int N) {
 
 
 // Helper function for using CUDA.
-extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
-	__int64 size, int blocks, int threads,
-	int u32LoopCount, double* h_odata,
-	int N, cublasHandle_t handle, double* d_correlationMatrix, double* d_averageMatrix, double* d_scaling_factors, 
-	FILE * binFile, FILE * AnalysisFile)
+extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			// Loop count
+	short* data,																		// Input data
+	const __int64 size,																	// Size of the input data
+	const int totalThreads,																// Total number of threads
+	const int gridSize,																	// Thread Grid size
+	const int blockSize,																// Thread Block size
+	const int sharedSegmentSize,														// Shared Memory segment size
+	const int demodulationWindowSize,													// Demodulation window size
+	const int totalSegNum,																// Total number of segments of input data
+	const int corrMatrixSize,															// Cross Correlation Matrix size
+	const int segmentSize,																// Data Segment size
+	double* h_odata,																	// Output data
+	cublasHandle_t handle,																// cuBLAS handle
+	double* d_aggregatedCorrMatrix,														// Aggregated correlation matrix
+	double* d_reducedCorrMatrix,														// Reduced correlation matrix, here means mean correlation matrix
+	double* d_scaling_factors,															// Scaling factors
+	FILE * binFile,																		// Binary file for storing reduced correlation matrix	
+	FILE * AnalysisFile)																// Analysis file showing the reduced correlation matrix
 {
 	cudaError_t cudaStatus = cudaSuccess; // Return status of CUDA functions
 
-	// Kernel launch configuration
-	int blockSize = 256;	// Threads per block
-	int totalThreads = (size / 32) * 64; // Total number of threads
-	int gridSize = (totalThreads + blockSize - 1) / blockSize; // Number of blocks
-	
 
-	// Demodulation at 8 for correlation matrix
-	//demodulationCorrelationAt8NoShared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix); 
-	int sharedSegmentSize = 128;
-	// Demodulation at 8 for correlation matrix with shared memory
-	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > ((short*)a, size, d_correlationMatrix, sharedSegmentSize, totalThreads);
+	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
+	demodulationCorrelationAt8Shared << <gridSize, blockSize >> > (data, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
 
 
-	// Perform matrix-vector multiplication using cuBLAS
-	// 64 x N matrix-vector multiplication
-	const int Nrows = 64;
-	const int Ncols = N;
+	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
+	const int Nrows = corrMatrixSize;
+	const int Ncols = totalSegNum;
 	const double alpha = 1.0;
 	const double beta = 0.0;
 
-	// d_correlationMatrix is a 64 x N matrix
-	// d_scaling_factors is a N x 1 vector
-	// d_averageMatrix is a 64 x 1 vector
+	// d_aggregatedCorrMatrix is a corrMatrixSize x totalSegNum matrix
+	// d_scaling_factors is a totalSegNum x 1 vector
+	// d_averageMatrix is a corrMatrixSize x 1 vector
 	cublasStatus_t cublasStatus = cublasDgemv(handle, CUBLAS_OP_N, Nrows, Ncols, &alpha,
-		d_correlationMatrix, 64,
+		d_aggregatedCorrMatrix, corrMatrixSize,
 		d_scaling_factors, 1,
-		&beta, d_averageMatrix, 1);
+		&beta, d_reducedCorrMatrix, 1);
 	checkCublas(cublasStatus, "cuBLAS Dgemv failed");
 
-	averageMatrixKernel << <1, 64 >> > (d_averageMatrix, N);	// Average the reduced matrix
+	averageMatrixKernel << <1, corrMatrixSize >> > (d_reducedCorrMatrix, totalSegNum);	// Average the reduced matrix
 
-	// Copy the result back to the host
-	checkCuda(cudaMemcpy(h_odata, d_averageMatrix, 64 * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	// Copy the result from device back to the host
+	checkCuda(cudaMemcpy(h_odata, d_reducedCorrMatrix, corrMatrixSize * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
 
 	// Wait for the GPU to finish
 	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
@@ -223,7 +231,7 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 	// Write results to Analysis file
 	if (AnalysisFile) {
 		fprintf(AnalysisFile, "%d\t", u32LoopCount);
-		for (int i = 0; i < 64; ++i) {
+		for (int i = 0; i < corrMatrixSize; ++i) {
 			fprintf(AnalysisFile, "%.10f\t", h_odata[i]);
 		}
 		fprintf(AnalysisFile, "\n");
@@ -231,7 +239,7 @@ extern "C" cudaError_t GPU_Equation_PlusOne(void* a,
 
 	// Write results to binary file for Matlab use
 	if (binFile) {
-		fwrite(h_odata, sizeof(double), 64, binFile);
+		fwrite(h_odata, sizeof(double), corrMatrixSize, binFile);
 	}
 
 	return cudaStatus;
