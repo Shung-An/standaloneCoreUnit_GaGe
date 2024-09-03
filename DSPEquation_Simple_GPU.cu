@@ -91,7 +91,7 @@ __global__ void demodulationCorrelationAt8Shared(short* data,
 	
 	// Declare shared memory
 	//__shared__ float sharedSegment[sharedSegmentSize]; 
-	extern __shared__ float sharedSegment[];
+	extern __shared__ double sharedSegment[];
 	// load data into shared memory
 	if (threadIdx.x < sharedSegmentSize) {
 		sharedSegment[threadIdx.x] = static_cast<float>(data[blockIdx.x * sharedSegmentSize + threadIdx.x]);
@@ -105,10 +105,10 @@ __global__ void demodulationCorrelationAt8Shared(short* data,
 
 		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
 
-		float value1 = sharedSegment[segmentStart + row * 2];
-		float value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) * 2];
-		float value3 = sharedSegment[segmentStart + col * 2 + 1];
-		float value4 = sharedSegment[segmentStart + (col + demodulationWindowSize) * 2 + 1];
+		double value1 = sharedSegment[segmentStart + row * 2];
+		double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) * 2];
+		double value3 = sharedSegment[segmentStart + col * 2 + 1];
+		double value4 = sharedSegment[segmentStart + (col + demodulationWindowSize) * 2 + 1];
 
 		double corrValue = (value1 - value2) * (value3 - value4);
 

@@ -8,10 +8,10 @@
 void computeCorrelationMatrix(short* segment, double* correlationMatrix) {
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
-            float value1 = (float)segment[i * 2];
-            float value2 = (float)segment[(i + 8) * 2];
-            float value3 = (float)segment[j * 2 + 1];
-            float value4 = (float)segment[(j + 8) * 2 + 1];
+            double value1 = (double)segment[i * 2];
+            double value2 = (double)segment[(i + 8) * 2];
+            double value3 = (double)segment[j * 2 + 1];
+            double value4 = (double)segment[(j + 8) * 2 + 1];
             double result = (value1 - value2) * (value3 - value4);
             correlationMatrix[i * 8 + j] = result;
         }

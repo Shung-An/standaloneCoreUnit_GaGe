@@ -54,6 +54,8 @@
 #define TRANSFER_TIMEOUT	10000				
 #define STREAM_BUFFERSZIZE	0x200000
 #define STM_SECTION _T("StmConfig")				// section name in ini file
+#define RAW_SIG_PIPE_NAME "\\\\.\\pipe\\DataPipe"
+#define COR_MAT_PIPE_NAME "\\\\.\\pipe\\CorrMatrixPipe"
 
 
 
@@ -143,6 +145,9 @@ extern cudaError_t ComputeCrossCorrelationGPU(
 
 extern void initializeArrayWithCuda(double* dev_array, int size, double value);
 extern int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matrix);
+extern HANDLE createAndConnectPipe(const char* pipeName, DWORD bufferSize);
+extern int handleClientRequests(HANDLE hPipe, short* data, double* corrMatrix, int segmentIndex, DWORD bytesToSend, int choice);
+extern bool CheckForRequest(HANDLE hPipe);
 
 #ifdef __cplusplus
 }
@@ -212,6 +217,7 @@ int _tmain()
 	cudaError_t					cudaStatus = cudaSuccess;
 	int64						i64TickFrequency = 0;
 	int							display_result = 1;
+	
 
 	clock_t pre_start_time, pre_current_time;
 	double pre_time;
@@ -1010,6 +1016,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	double* d_reducedCorrMatrix = NULL;
 	double* d_scaling_factors = NULL;
 
+	//const char* raw_signal_pipe_name = "\\\\.\\pipe\\DataPipe";
+	//const char* corr_matrix_pipe_name = "\\\\.\\pipe\\CorrMatrixPipe";
+
+
 	int					correlationMatrixSize = 0;	// Size of the correlation matrix in array form
 	int					N = 0;		// N is segment number in one data transfer
 
@@ -1047,6 +1057,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	uInt32				totalSegNum;														// Total number of segments in the data transfer
 	int					corrMatrixSize; 													// Size of the correlation matrix
 	int					segmentSize;														// Size of one segment in the input data 
+
+
+
+	HANDLE raw_signal_hPipe = createAndConnectPipe(RAW_SIG_PIPE_NAME, 0);
 
 
 
@@ -1406,6 +1420,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					bDone = TRUE;
 				}
 			}
+
+			if (NULL != pWorkBuffer) {
+				int result = handleClientRequests(raw_signal_hPipe, pWorkBuffer, h_odata, 0, 200, 0);  // 200 is the number of bytes to send, check request from client and send data
+			}
+			
 
 			// Wait for the DMA transfer on the current buffer to complete so we can loop back around to start a new one.
 			// The calling thread will sleep until the transfer completes
