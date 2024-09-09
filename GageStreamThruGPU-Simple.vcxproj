@@ -99,7 +99,7 @@
     <ClInclude Include="C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsSdkMisc.h" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="x64\Debug\StreamThruGPU.ini" />
+    <None Include="StreamThruGPU.ini" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

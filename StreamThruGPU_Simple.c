@@ -105,6 +105,8 @@ typedef struct
 	int32 gpu_block_size;			/* GPU block size */
 	BOOL use_cpu_verify;					/* Verify the GPU Calculation result with CPU Calculation or not */	
 	BOOL profile;							/* Profile the experiment or not*/
+	int32 correlation_type;				/* Correlation type - corss correlation or g2 correlation */
+	BOOL useIPC;							/* Use IPC or not */
 }EXPCONFIG, * PEXPCONFIG;
 
 
@@ -142,6 +144,30 @@ extern cudaError_t ComputeCrossCorrelationGPU(
 	double* d_scaling_factors,															// Scaling factors
 	FILE * binFile,																		// Binary file for storing reduced correlation matrix	
 	FILE * AnalysisFile);																// Analysis file showing the reduced correlation matrix
+
+extern cudaError_t ComputeG2CorrelationGPU(
+	const __int64 u32LoopCount,           // Loop count
+	short* data,                                                                     // Input data
+	const __int64 size,                                                              // Size of the input data
+	const int totalThreads,                                                          // Total number of threads
+	const int gridSize,                                                              // Thread Grid size
+	const int blockSize,                                                             // Thread Block size
+	const int sharedSegmentSize,                                                     // Shared Memory segment size
+	const int demodulationWindowSize,													// Demodulation window size
+	const int totalSegNum,                                                           // Total number of segments of input data
+	const int corrMatrixSize,                                                        // Auto Correlation Matrix size
+	const int segmentSize,                                                           // Data Segment size
+	double* h_odata,                                                                 // Output data
+	cublasHandle_t handle,                                                           // cuBLAS handle
+	double* d_correlationMatrixA,                                                    // Correlation matrix A
+	double* d_correlationMatrixB,                                                    // Correlation matrix B
+	double* d_g2Matrix,                                                              // G2 matrix (final output)
+	double* d_reducedCorrMatrixA,                                                     // Reduced Auto correlation matrix A
+	double* d_reducedCorrMatrixB,                                                     // Reduced Auto correlation matrix B
+	double* d_scaling_factors,                                                       // Scaling factors
+	FILE * binFile,                                                                  // Binary file for storing the G2 matrix
+	FILE * AnalysisFile);                                                             // Analysis file for showing the G2 matrix
+
 
 extern void initializeArrayWithCuda(double* dev_array, int size, double value);
 extern int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matrix);
@@ -924,6 +950,8 @@ int32 LoadExperimentConfiguration(LPCTSTR szIniFile, PEXPCONFIG pConfig)
 	ExpCfg.use_cpu_verify = FALSE;
 	ExpCfg.demodulation_window_size = 16;
 	ExpCfg.gpu_block_size = 256;
+	ExpCfg.correlation_type = 0;
+	ExpCfg.useIPC = FALSE;
 
 	if (NULL == pConfig)
 	{
@@ -954,6 +982,12 @@ int32 LoadExperimentConfiguration(LPCTSTR szIniFile, PEXPCONFIG pConfig)
 
 	nDefault = ExpCfg.gpu_block_size;
 	ExpCfg.gpu_block_size = GetPrivateProfileInt(EXP_SECTION, _T("GPUBlockSize"), nDefault, szFilePath);
+
+	nDefault = ExpCfg.correlation_type;
+	ExpCfg.correlation_type = GetPrivateProfileInt(EXP_SECTION, _T("CorrelationType"), nDefault, szFilePath);
+
+	nDefault = ExpCfg.useIPC;
+	ExpCfg.useIPC = (0 != GetPrivateProfileInt(EXP_SECTION, _T("UseIPC"), nDefault, szFilePath));
 
 	*pConfig = ExpCfg;
 	return (CS_SUCCESS);
@@ -1012,12 +1046,20 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	void* pCurrentBuffer = NULL;
 	void* pWorkBuffer = NULL;
 
+	// host pointers for receiving the processed data from GPU
+	double* h_odata = NULL;
+
+	// Device pointers for the cross correlation matrices
 	double* d_aggregatedCorrMatrix = NULL;
 	double* d_reducedCorrMatrix = NULL;
 	double* d_scaling_factors = NULL;
 
-	//const char* raw_signal_pipe_name = "\\\\.\\pipe\\DataPipe";
-	//const char* corr_matrix_pipe_name = "\\\\.\\pipe\\CorrMatrixPipe";
+	// device pointers for the g2 correlation matrices
+	double* d_correlationMatrixA = NULL;
+	double* d_correlationMatrixB = NULL;
+	double* d_g2Matrix = NULL;
+	double* d_reducedCorrMatrixA = NULL;
+	double* d_reducedCorrMatrixB = NULL;
 
 
 	int					correlationMatrixSize = 0;	// Size of the correlation matrix in array form
@@ -1045,8 +1087,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	BOOL				bStreamCompletedSuccess = FALSE;
 	cudaError_t			cudaStatus = 0;
 
+	// Experiment Configuration
 	BOOL				timer = g_ExpConfig.profile;	// 1 for profiling the time, 0 for not profiling the time
 	BOOL				use_cpu = g_ExpConfig.use_cpu_verify;	// 1 for using CPU to verify GPU results, 0 for not using CPU
+	int                 correlation_type = g_ExpConfig.correlation_type;	// 0 for cross-correlation, 1 for g2-correlation
+	BOOL				useIPC = g_ExpConfig.useIPC;	// 1 for using IPC, 0 for not using IPC
 
 	// CUDA HyperParameters
 	uInt32				totalThreads;														// Total number of threads lanuched in the kernel
@@ -1058,9 +1103,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	int					corrMatrixSize; 													// Size of the correlation matrix
 	int					segmentSize;														// Size of one segment in the input data 
 
+	HANDLE raw_signal_hPipe = NULL;
 
-
-	HANDLE raw_signal_hPipe = createAndConnectPipe(RAW_SIG_PIPE_NAME, 0);
+	if (useIPC) {
+		raw_signal_hPipe = createAndConnectPipe(RAW_SIG_PIPE_NAME, 0);
+	}
+	
 
 
 
@@ -1228,38 +1276,110 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		sharedSegmentSize = blockSize * 4 / demodulationWindowSize;							// Size of the shared memory segment of one block
 		gridSize = (totalThreads + blockSize - 1) / blockSize;								// Number of blocks in the grid
 
-		double* h_odata = (float*)malloc(corrMatrixSize * sizeof(double));		// Output data from the GPU
 
-		int aggregatedCorreMatrixSize = totalSegNum * corrMatrixSize; // Size of correlation matrix for one data transfer
+		if (correlation_type == 0) {
+			// Allocate memory for the correlation matrix (aggregated and reduced), hodata and scaling factors
+		
+			h_odata = (double*)malloc(corrMatrixSize * sizeof(double));		// Output data from the GPU
+
+			int aggregatedCorreMatrixSize = totalSegNum * corrMatrixSize; // Size of correlation matrix for one data transfer
 		
 
-		cudaStatus = cudaMalloc((void**)&d_aggregatedCorrMatrix, aggregatedCorreMatrixSize * sizeof(double));		// Allocate memory for the correlation matrix
+			cudaStatus = cudaMalloc((void**)&d_aggregatedCorrMatrix, aggregatedCorreMatrixSize * sizeof(double));		// Allocate memory for the correlation matrix
 		
-		if (cudaStatus != cudaSuccess) {
-			// Handle error...
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
 
-			return cudaStatus;
+				return cudaStatus;
+			}
+
+			cudaStatus = cudaMalloc((void**)&d_reducedCorrMatrix, corrMatrixSize * sizeof(double));		// Allocate memory for the reduced matrix
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_aggregatedCorrMatrix);
+				return cudaStatus;
+			}
+
+			cudaStatus = cudaMalloc((void**)&d_scaling_factors, totalSegNum * sizeof(double));		// Allocate memory for the scaling factors
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_aggregatedCorrMatrix);
+				cudaFree(d_reducedCorrMatrix);
+				return cudaStatus;
+			}
+
+			// Initialize the array with 1.0
+			double value = 1.0;
+			initializeArrayWithCuda(d_scaling_factors, totalSegNum, value);
 		}
 
-		cudaStatus = cudaMalloc((void**)&d_reducedCorrMatrix, corrMatrixSize * sizeof(double));		// Allocate memory for the reduced matrix
-		if (cudaStatus != cudaSuccess) {
-			// Handle error...
-			cudaFree(d_aggregatedCorrMatrix);
-			return cudaStatus;
+		else if (correlation_type == 1) {
+			// Allocate memory for d_correlationMatrixA, dcorrelationMatrixB, d_g2Matrix, d_reducdeCorrMatrixA, d_reducedCorrMatrixB, d_scaling_factors and h_odata
+			h_odata = (double*)malloc(corrMatrixSize * corrMatrixSize * sizeof(double));		// Output data from the GPU
+			
+
+
+			// Declare the variable before using it
+			int aggregatedCorreMatrixSize = totalSegNum * corrMatrixSize; // Size of correlation matrix for one data transfer
+
+			// Now use it for memory allocation
+			cudaStatus = cudaMalloc((void**)&d_correlationMatrixA, aggregatedCorreMatrixSize * sizeof(double));
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				return cudaStatus;
+			}
+
+			cudaStatus = cudaMalloc((void**)&d_correlationMatrixB, aggregatedCorreMatrixSize * sizeof(double));
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_correlationMatrixA);
+				return cudaStatus;
+			}
+
+
+			cudaStatus = cudaMalloc((void**)&d_g2Matrix, corrMatrixSize * corrMatrixSize * sizeof(double));		// Allocate memory for the d_g2Matrix
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_correlationMatrixA);
+				cudaFree(d_correlationMatrixB);
+				return cudaStatus;
+			}
+
+			cudaStatus = cudaMalloc((void**)&d_reducedCorrMatrixA, corrMatrixSize * sizeof(double));		// Allocate memory for the d_reducedCorrMatrixA
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_correlationMatrixA);
+				cudaFree(d_correlationMatrixB);
+				cudaFree(d_g2Matrix);
+				return cudaStatus;
+			}
+
+			cudaStatus = cudaMalloc((void**)&d_reducedCorrMatrixB, corrMatrixSize * sizeof(double));		// Allocate memory for the d_reducedCorrMatrixB
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_correlationMatrixA);
+				cudaFree(d_correlationMatrixB);
+				cudaFree(d_g2Matrix);
+				cudaFree(d_reducedCorrMatrixA);
+				return cudaStatus;
+			}
+
+			cudaStatus = cudaMalloc((void**)&d_scaling_factors, totalSegNum * sizeof(double));		// Allocate memory for the scaling factors
+			if (cudaStatus != cudaSuccess) {
+				// Handle error...
+				cudaFree(d_correlationMatrixA);
+				cudaFree(d_correlationMatrixB);
+				cudaFree(d_g2Matrix);
+				cudaFree(d_reducedCorrMatrixA);
+				cudaFree(d_reducedCorrMatrixB);
+				return cudaStatus;
+			}
+
+			// Initialize the array with 1.0
+			double value = 1.0;
+			initializeArrayWithCuda(d_scaling_factors, totalSegNum, value);
 		}
 
-		cudaStatus = cudaMalloc((void**)&d_scaling_factors, totalSegNum * sizeof(double));		// Allocate memory for the scaling factors
-		if (cudaStatus != cudaSuccess) {
-			// Handle error...
-			cudaFree(d_aggregatedCorrMatrix);
-			cudaFree(d_reducedCorrMatrix);
-			return cudaStatus;
-		}
-
-		// Initialize the array with 1/N
-		double value = 1.0;
-		initializeArrayWithCuda(d_scaling_factors, totalSegNum, value);
-	
 
 		// Create cuBLAS handle
 		cublasHandle_t CUhandle;
@@ -1351,7 +1471,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 			// do processing here on dbuffer
 			
-			if (g_GpuConfig.bDoAnalysis && NULL != d_buffer)
+			if (NULL != d_buffer)
 			{
 				if (g_GpuConfig.bUseGpu)
 				{
@@ -1359,25 +1479,53 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					if (timer == TRUE) 
 						QueryPerformanceCounter(&process_start_time);	 // mark the start time of data processing	
 
-					// perform cross correlation compute using GPU on the input data
-					cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
-															(short*) d_buffer,
-															u32TransferSizeSamples,
-															totalThreads,
-															gridSize,
-															blockSize,
-															sharedSegmentSize,
-															demodulationWindowSize,
-															totalSegNum,
-															corrMatrixSize,
-															segmentSize,
-															h_odata,
-															CUhandle,
-															d_aggregatedCorrMatrix,
-															d_reducedCorrMatrix,
-															d_scaling_factors,
-															binFile,
-															AnalysisFile);
+					if (correlation_type == 0) {
+						// perform cross correlation compute using GPU on the input data
+						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
+							(short*)d_buffer,
+							u32TransferSizeSamples,
+							totalThreads,
+							gridSize,
+							blockSize,
+							sharedSegmentSize,
+							demodulationWindowSize,
+							totalSegNum,
+							corrMatrixSize,
+							segmentSize,
+							h_odata,
+							CUhandle,
+							d_aggregatedCorrMatrix,
+							d_reducedCorrMatrix,
+							d_scaling_factors,
+							binFile,
+							AnalysisFile);
+					}
+
+					else if (correlation_type == 1) {
+						// perform g2 correlation compute using GPU on the input data
+						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
+							(short*)d_buffer,
+							u32TransferSizeSamples,
+							totalThreads,
+							gridSize,
+							blockSize,
+							sharedSegmentSize,
+							demodulationWindowSize,
+							totalSegNum,
+							corrMatrixSize,
+							segmentSize,
+							h_odata,
+							CUhandle,
+							d_correlationMatrixA,
+							d_correlationMatrixB,
+							d_g2Matrix,
+							d_reducedCorrMatrixA,
+							d_reducedCorrMatrixB,
+							d_scaling_factors,
+							binFile,
+							AnalysisFile);
+					}
+					
 					
 
 					if (timer == TRUE) {
@@ -1421,7 +1569,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				}
 			}
 
-			if (NULL != pWorkBuffer) {
+			if (NULL != pWorkBuffer && useIPC) {
 				int result = handleClientRequests(raw_signal_hPipe, pWorkBuffer, h_odata, 0, 200, 0);  // 200 is the number of bytes to send, check request from client and send data
 			}
 			
@@ -1576,9 +1724,22 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		// Free the memory on the GPU and CPU, and destroy the cuBLAS handle
 		free(h_odata);
 		cublasDestroy(CUhandle);
-		cudaFree(d_aggregatedCorrMatrix);
-		cudaFree(d_reducedCorrMatrix);
-		cudaFree(d_scaling_factors);
+
+		if (correlation_type == 0) {
+			cudaFree(d_aggregatedCorrMatrix);
+			cudaFree(d_reducedCorrMatrix);
+			cudaFree(d_scaling_factors);
+		}
+
+		else if (correlation_type == 1) {
+			cudaFree(d_correlationMatrixA);
+			cudaFree(d_correlationMatrixB);
+			cudaFree(d_g2Matrix);
+			cudaFree(d_reducedCorrMatrixA);
+			cudaFree(d_reducedCorrMatrixB);
+			cudaFree(d_scaling_factors);
+		}
+		
 		
 
 
