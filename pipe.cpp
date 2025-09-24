@@ -11,7 +11,7 @@ extern "C" HANDLE createAndConnectPipe(const char* pipeName, DWORD bufferSize) {
 		PIPE_TYPE_BYTE |           // Byte-type pipe
 		PIPE_READMODE_BYTE |       // Byte-read mode
 		PIPE_WAIT,                 // Blocking mode
-		1,                         // Max number of instances
+			1,                         // Max number of instances
 		bufferSize,                // Output buffer size
 		bufferSize,                // Input buffer size
 		0,                         // Default timeout

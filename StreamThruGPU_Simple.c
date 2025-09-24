@@ -1277,7 +1277,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		gridSize = (totalThreads + blockSize - 1) / blockSize;								// Number of blocks in the grid
 
 
-		if (correlation_type == 0) {
+		if (correlation_type == 1) {
 			// Allocate memory for the correlation matrix (aggregated and reduced), hodata and scaling factors
 		
 			h_odata = (double*)malloc(corrMatrixSize * sizeof(double));		// Output data from the GPU
@@ -1313,7 +1313,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			initializeArrayWithCuda(d_scaling_factors, totalSegNum, value);
 		}
 
-		else if (correlation_type == 1) {
+		else if (correlation_type == 0) {
 			// Allocate memory for d_correlationMatrixA, dcorrelationMatrixB, d_g2Matrix, d_reducdeCorrMatrixA, d_reducedCorrMatrixB, d_scaling_factors and h_odata
 			h_odata = (double*)malloc(corrMatrixSize * corrMatrixSize * sizeof(double));		// Output data from the GPU
 			
@@ -1418,11 +1418,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		// loop until either we've done the number of segments we want, or
 		// the ESC key was pressed to abort. While we loop, we transfer data into
 		// pCurrentBuffer and save pWorkBuffer to hard disk
-
-
+		
 		while (!(bDone || bStreamCompletedSuccess))
 		{	
-			if (timer == TRUE) {
+			if (timer) {
 				QueryPerformanceCounter(&step_start_time);		// mark the start time
 				}
 
@@ -1451,10 +1450,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			}
 
 
-			if (timer == TRUE) 
+			if (timer) 
 				QueryPerformanceCounter(&transfer_start_time);  // mark the start time of data transfer and processing
 
+			
 			i32Status = CsStmTransferToBuffer(g_hSystem, nCardIndex, pCurrentBuffer, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
+			
 
 			if (CS_FAILED(i32Status))
 			{
@@ -1476,10 +1477,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				if (g_GpuConfig.bUseGpu)
 				{
 
-					if (timer == TRUE) 
+					if (timer) 
 						QueryPerformanceCounter(&process_start_time);	 // mark the start time of data processing	
 
-					if (correlation_type == 0) {
+					if (correlation_type == 1) {
 						// perform cross correlation compute using GPU on the input data
 						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
 							(short*)d_buffer,
@@ -1501,7 +1502,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 							AnalysisFile);
 					}
 
-					else if (correlation_type == 1) {
+					else if (correlation_type == 0) {
 						// perform g2 correlation compute using GPU on the input data
 						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
 							(short*)d_buffer,
@@ -1528,7 +1529,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					
 					
 
-					if (timer == TRUE) {
+					if (timer) {
 						QueryPerformanceCounter(&process_end_time);  // mark the end time of data processing
 						process_time = ((double)(process_end_time.QuadPart - process_start_time.QuadPart)) / freq;
 					}
@@ -1540,10 +1541,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						break;
 					}
 				}
-
-				if (use_cpu == TRUE && NULL != pWorkBuffer) // use CPU for verify the correctness of the GPU Calculation
+				
+				if (use_cpu && NULL != pWorkBuffer) // use CPU for verify the correctness of the GPU Calculation
 				{
-					i32Status = CPU_Equation_PlusOne(pWorkBuffer, u32TransferSizeSamples, h_odata);
+					i32Status = CPU_Equation_PlusOne(pWorkBuffer, u32TransferSizeSamples, h_odata); // This equation takes a while
 
 					if (CS_FAILED(i32Status))
 					{
@@ -1556,6 +1557,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			
 
 			// Save the data to the hard disk
+			
 			if (g_StreamConfig.bSaveToFile && NULL != pWorkBuffer)
 			{
 				// While data transfer of the current buffer is in progress, save the data from pWorkBuffer to hard disk
@@ -1568,15 +1570,16 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					bDone = TRUE;
 				}
 			}
+			
 
 			if (NULL != pWorkBuffer && useIPC) {
 				int result = handleClientRequests(raw_signal_hPipe, pWorkBuffer, h_odata, 0, 200, 0);  // 200 is the number of bytes to send, check request from client and send data
 			}
 			
-
 			// Wait for the DMA transfer on the current buffer to complete so we can loop back around to start a new one.
 			// The calling thread will sleep until the transfer completes
 			i32Status = CsStmGetTransferStatus(g_hSystem, nCardIndex, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength, &u8EndOfData);
+
 
 			if (timer ==TRUE) {
 				QueryPerformanceCounter(&transfer_end_time);  // Mark the end time of data transfer and processing

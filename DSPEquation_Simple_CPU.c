@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,16 +19,16 @@ void computeCorrelationMatrix(short* segment, double* correlationMatrix) {
 
 // Function to average all correlation matrices
 void averageCorrelationMatrices(double* correlationMatrices, double* averageMatrix, int numSegments) {
-	memset(averageMatrix, 0, 64 * sizeof(double));      // Initialize average matrix to zero
-  
-	// Sum all correlation matrices
+    memset(averageMatrix, 0, 64 * sizeof(double));      // Initialize average matrix to zero
+
+    // Sum all correlation matrices
     for (int k = 0; k < numSegments; k++) {
         for (int i = 0; i < 64; i++) {
-            averageMatrix[i] +=  correlationMatrices[k * 64 + i];
+            averageMatrix[i] += correlationMatrices[k * 64 + i];
         }
     }
 
-	// Average the correlation matrices
+    // Average the correlation matrices
     for (int i = 0; i < 64; i++) {
         averageMatrix[i] /= numSegments;
     }
@@ -59,7 +58,7 @@ int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matri
     double* correlationMatrices = (double*)malloc(numSegments * 64 * sizeof(double));
     double* averageMatrix = (double*)malloc(64 * sizeof(double));
 
-	// Check if memory allocation was successful
+    // Check if memory allocation was successful
     if (!correlationMatrices || !averageMatrix) {
         printf("Memory allocation failed\n");
         return -1;
@@ -70,7 +69,7 @@ int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matri
         computeCorrelationMatrix(&inputArray[i * 32], &correlationMatrices[i * 64]);
     }
 
-  
+
     // Average the correlation matrices
     averageCorrelationMatrices(correlationMatrices, averageMatrix, numSegments);
 
@@ -88,8 +87,8 @@ int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matri
     }
 
 
-	// Write the average correlation matrix to the file
-	fprintf(fptr, "CPU Average Correlation Matrix:\n");
+    // Write the average correlation matrix to the file
+    fprintf(fptr, "CPU Average Correlation Matrix:\n");
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
             fprintf(fptr, "%.10f ", averageMatrix[i * 8 + j]);
@@ -98,7 +97,7 @@ int CPU_Equation_PlusOne(void* buffer, __int64 length, double* gpu_average_matri
     fprintf(fptr, "\n");
 
 
-	// Write the result of the comparison to the file
+    // Write the result of the comparison to the file
     if (gpu_correct) {
         fprintf(fptr, "GPU Compution is correct.\n");
     }

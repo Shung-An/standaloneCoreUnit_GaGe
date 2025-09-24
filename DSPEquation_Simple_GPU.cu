@@ -22,6 +22,7 @@ void checkCuda(cudaError_t result, const char* msg) {
 void checkCublas(cublasStatus_t result, const char* msg) {
 	if (result != CUBLAS_STATUS_SUCCESS) {
 		std::cerr << "cuBLAS Error: " << msg << "\n";
+		std::cerr << "Error Code: " << result << "\n";
 		exit(EXIT_FAILURE);
 	}
 }
@@ -117,6 +118,7 @@ __global__ void demodulationAutoCorrelation(short* data,
 		// Store the correlation matrix in column-major order
 		autoCorrelationMatrixA[index] = corrValueA; // Correlation matrix, one column is a single correlation matrix
 		autoCorrelationMatrixB[index] = corrValueB; // Correlation matrix, one column is a single correlation matrix
+
 	}
 }
 
@@ -150,6 +152,16 @@ __global__ void averageMatrixKernel(double* averageMatrix, int N) {
 	}
 }
 
+__global__ void divideG2Matrix(double* g2Matrix, double* d_reducedCorrMatrixA, double* d_reducedCorrMatrixB, int size, int totalSegNum) {
+	int ij = threadIdx.x; // ij index 
+	int mn = blockIdx.x; // mn index
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; // get the index of the thread in global space 
+
+    if (idx < size) {
+        g2Matrix[idx] /= d_reducedCorrMatrixA[ij] * d_reducedCorrMatrixB[mn] / totalSegNum; 
+    }
+}
+
 
 // Helper function for using CUDA to compute cross correlation.
 extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			// Loop count
@@ -175,8 +187,8 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 
 
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
-	demodulationCrossCorrelation << <gridSize, blockSize >> > (data, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
-
+	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
+	
 
 	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
 	const int Nrows = corrMatrixSize;
@@ -187,6 +199,7 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	// d_aggregatedCorrMatrix is a corrMatrixSize x totalSegNum matrix
 	// d_scaling_factors is a totalSegNum x 1 vector
 	// d_averageMatrix is a corrMatrixSize x 1 vector
+
 	cublasStatus_t cublasStatus = cublasDgemv(handle, CUBLAS_OP_N, Nrows, Ncols, &alpha,
 		d_aggregatedCorrMatrix, corrMatrixSize,
 		d_scaling_factors, 1,
@@ -246,10 +259,9 @@ extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,      
 	cudaError_t cudaStatus = cudaSuccess; // Return status of CUDA functions
 
 	// Compute correlation matrices A and B using shared memory
-	demodulationAutoCorrelation << <gridSize, blockSize >> > (data, size, d_correlationMatrixA, d_correlationMatrixB, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
+	demodulationAutoCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, size, d_correlationMatrixA, d_correlationMatrixB, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
 	
-	
-	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix A
+	// Perform matrix-vector multiplication using cuBLAS for reducing the aggregated correlation matrix A
 	// 64 x N matrix-vector multiplication
 	int Nrows = corrMatrixSize;
 	int Ncols = totalSegNum;
@@ -263,7 +275,7 @@ extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,      
 		d_correlationMatrixA, corrMatrixSize,
 		d_scaling_factors, 1,
 		&beta, d_reducedCorrMatrixA, 1);
-	checkCublas(cublasStatus_1, "cuBLAS Dgemv failed");
+	checkCublas(cublasStatus_1, "cuBLAS Dgemv 0 failed");
 
 	// d_correlationMatrix is a corrMatrixSize x totalSegNum matrix
 	// d_scaling_factors is a totalSegNum x 1 vector
@@ -272,7 +284,7 @@ extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,      
 		d_correlationMatrixB, corrMatrixSize,
 		d_scaling_factors, 1,
 		&beta, d_reducedCorrMatrixB, 1);
-	checkCublas(cublasStatus_2, "cuBLAS Dgemv failed");
+	checkCublas(cublasStatus_2, "cuBLAS Dgemv 1 failed");
 
 	
 	// Perform matrix-matrix multiplication using cuBLAS for G2 correlation matrix computation
@@ -290,15 +302,16 @@ extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,      
 		Nrows, Ncols, Kdim,
 		&alpha,
 		d_correlationMatrixA, Nrows,  // Leading dimension of matrix A is Nrows (corrMatrixSize)
-		d_correlationMatrixB, Kdim,  // Leading dimension of matrix B is Kdim (corrMatrixSize), since B is transposed
+		d_correlationMatrixB, Kdim,  // Leading dimension of matrix B is Kdim (totalSegNum), since B is transposed
 		&beta,
 		d_g2Matrix, Nrows  // Output G2 matrix has leading dimension Nrows (corrMatrixSize)
 	);
 	checkCublas(cublasStatus_3, "cuBLAS Dgemm for G2 correlation matrix failed");
 
 
-	// TODO: Divide the g2 matrix by auto correlation matrix A and B
-
+	// Divide the g2 matrix by auto correlation matrix A and B
+	divideG2Matrix << <Nrows, Ncols >> > (d_g2Matrix, d_reducedCorrMatrixA, d_reducedCorrMatrixB, corrMatrixSize * corrMatrixSize, totalSegNum);
+	
 	// Copy the result back to the host
 	checkCuda(cudaMemcpy(h_odata, d_g2Matrix, corrMatrixSize * corrMatrixSize * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
 
