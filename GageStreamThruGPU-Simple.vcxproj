@@ -101,6 +101,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsSdkMisc.h" />
+    <ClInclude Include="MultipleSystem.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="StreamThruGPU.ini" />

@@ -40,6 +40,7 @@
 #include "C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsAppSupport.h"
 #include "C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsSdkMisc.h"
 #include "C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsTchar.h"
+#include "MultipleSystem.h"
 #include "CsExpert.h"
 #include <time.h>
 #include <io.h>
@@ -118,7 +119,9 @@ uInt32 GetSectorSize();
 
 void  UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes, FILE* AnalysisFile);
 int32 LoadStmConfiguration(LPCTSTR szIniFile, PCSSTMCONFIG pConfig);
-DWORD WINAPI CardStreamThread(void* CardIndex);
+// forward declarations
+DWORD WINAPI StreamSystemThread(void* p);
+DWORD WINAPI CardStreamThread(void* p);
 BOOL Prepare_Cleanup();
 
 #ifdef __cplusplus
@@ -209,7 +212,6 @@ HANDLE						g_hStreamStarted = NULL;
 HANDLE						g_hStreamAbort = NULL;
 HANDLE						g_hStreamError = NULL;
 HANDLE						g_hThreadReadyForStream = NULL;
-CSHANDLE					g_hSystem = 0;
 CSSYSTEMINFO				g_CsSysInfo = { 0 };
 CSACQUISITIONCONFIG			g_CsAcqCfg = { 0 };
 CSSTMCONFIG					g_StreamConfig = { 0 }; // Stream configuration
@@ -218,445 +220,233 @@ EXPCONFIG					g_ExpConfig;	// Experiment configuration
 CS_STRUCT_DATAFORMAT_INFO	g_DataFormatInfo = { 0 };
 double						diff_time[MAX_CARDS_COUNT] = { 0. };
 
-int _tmain()
+typedef struct {
+	CSHANDLE hSystem;        // system handle (do NOT use a global)
+	uInt16   cardIndex;      // 1..BoardCount
+	int      sysId;     // 1-based system number (optional, for filenames)
+	void* pHostBuf;        // assigned host buffer for this card
+	void* pCudaHostAligned;// aligned host pointer you registered (if GPU)
+	void* pCudaDevPtr;     // device pointer mapped from host (if GPU)
+	uInt32   bufSizeBytes;    // size to use
+} CARD_ARG;
+
+
+
+// --- REPLACE your _tmain with this minimal orchestrator ---
+int _tmain(void)
 {
-	int32						i32Status = CS_SUCCESS;
-	uInt32						u32Mode;
-	CSSYSTEMINFO				CsSysInfo = { 0 };
-	LPCTSTR						szIniFile = _T("StreamThruGPU.ini");
-	BOOL						bDone = FALSE;
-	long long					llSystemTotalData = 0;
-	uInt16						n;
-	uInt16						i;
-	DWORD						dwWaitStatus;
-	DWORD						dwThreadId;
-	uInt32						u32TickStart = 0;
-	uInt32						u32TickNow = 0;
-	double						dTotalData = 0.0;
+	const TCHAR* kSharedIni = _T("System.ini");   // same INI for all systems
+	int32 i32Status;
 
-	BOOL						bStreamPackedSupported = FALSE;
+	int nSystems = CsInitialize();
+	if (CS_FAILED(nSystems)) { DisplayErrorString(nSystems); return -1; }
+	if (nSystems <= 0) { _ftprintf(stderr, _T("No CompuScope systems found.\n")); return 0; }
 
-	int32						i32MaxThreadsPerBlock;
-	int32						i32MaxBlocks;
-	BOOL						bPinGenericMemory = TRUE;
-	int32						i32CudaDevice = 0;
-	cudaError_t					cudaStatus = cudaSuccess;
-	int64						i64TickFrequency = 0;
-	int							display_result = 1;
-	
+	CSHANDLE* phSystem = (CSHANDLE*)VirtualAlloc(NULL, nSystems * sizeof(CSHANDLE), MEM_COMMIT, PAGE_READWRITE);
+	HANDLE* phThread = (HANDLE*)VirtualAlloc(NULL, nSystems * sizeof(HANDLE), MEM_COMMIT, PAGE_READWRITE);
+	if (!phSystem || !phThread) { _ftprintf(stderr, _T("Allocation failed.\n")); return 0; }
+	ZeroMemory(phThread, nSystems * sizeof(HANDLE));
 
-	clock_t pre_start_time, pre_current_time;
-	double pre_time;
+	int launched = 0;
+	for (int s = 0; s < nSystems; ++s) {
+		i32Status = CsGetSystem(&phSystem[s], 0, 0, 0, 0);
+		if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); continue; }
 
-	pre_start_time = clock();
+		THREADSTRUCT* pArg = (THREADSTRUCT*)malloc(sizeof * pArg);   // UNIQUE arg per system
+		if (!pArg) { _ftprintf(stderr, _T("Out of memory (system %d)\n"), s + 1); continue; }
+		ZeroMemory(pArg, sizeof * pArg);
+		pArg->hSystem = phSystem[s];
+		pArg->Sys = s + 1;                       // 1-based system id
+		_tcsncpy(pArg->lpFilename, kSharedIni, _countof(pArg->lpFilename) - 1);
+		pArg->lpFilename[_countof(pArg->lpFilename) - 1] = 0;
 
-	// Initializes the CompuScope boards found in the system. If the
-	// system is not found a message with the error code will appear.
-	// Otherwise i32Status will contain the number of systems found.
-	i32Status = CsInitialize();
-
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		return (-1);
+		phThread[s] = CreateThread(NULL, 0, StreamSystemThread, pArg, 0, NULL);
+		if (!phThread[s]) { _ftprintf(stderr, _T("CreateThread failed (system %d)\n"), s + 1); free(pArg); continue; }
+		++launched;
 	}
 
-	// Get the system. This sample program only supports one system. If
-	// 2 systems or more are found, the first system that is found
-	// will be the system that will be used. g_hSystem will hold a unique
-	// system identifier that is used when referencing the system.
-	i32Status = CsGetSystem(&g_hSystem, 0, 0, 0, 0);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		return (-1);
+	if (launched > 0) {
+		HANDLE* waitList = (HANDLE*)_alloca(launched * sizeof(HANDLE));
+		int k = 0; for (int s = 0; s < nSystems; ++s) if (phThread[s]) waitList[k++] = phThread[s];
+		WaitForMultipleObjects(k, waitList, TRUE, INFINITE);
+		for (int s = 0; s < nSystems; ++s) if (phThread[s]) CloseHandle(phThread[s]);
+	}
+	else {
+		_ftprintf(stderr, _T("No system threads launched.\n"));
 	}
 
-	// Get System information. The u32Size field must be filled in
-	// prior to calling CsGetSystemInfo
-	CsSysInfo.u32Size = sizeof(CSSYSTEMINFO);
-	i32Status = CsGetSystemInfo(g_hSystem, &CsSysInfo);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-	// A copy used in the threads to build headers
-	g_CsSysInfo = CsSysInfo;
-
-	// Display the system name from the driver
-	_ftprintf(stdout, _T("\nBoard Name: %s"), CsSysInfo.strBoardName);
-
-	//	We are analysing the ini file to find the number of triggers
-	i32Status = CsAs_ConfigureSystem(g_hSystem, (int)CsSysInfo.u32ChannelCount,
-		(int)CalculateTriggerCountFromConfig(&CsSysInfo, (LPCTSTR)szIniFile),
-		(LPCTSTR)szIniFile, &u32Mode);
-
-	if (CS_FAILED(i32Status))
-	{
-		if (CS_INVALID_FILENAME == i32Status)
-		{
-			// Display message but continue on using defaults.
-			_ftprintf(stdout, _T("\nCannot find %s - using default parameters."), szIniFile);
-		}
-		else
-		{
-
-			// Otherwise the call failed.  If the call did fail we should free the CompuScope
-			// system so it's available for another application
-			DisplayErrorString(i32Status);
-			CsFreeSystem(g_hSystem);
-			return(-1);
-		}
-	}
-
-	// If the return value is greater than  1, then either the application, 
-	// acquisition, some of the Channel and / or some of the Trigger sections
-	// were missing from the ini file and the default parameters were used. 
-	if (CS_USING_DEFAULT_ACQ_DATA & i32Status)
-		_ftprintf(stdout, _T("\nNo ini entry for acquisition. Using defaults."));
-
-	if (CS_USING_DEFAULT_CHANNEL_DATA & i32Status)
-		_ftprintf(stdout, _T("\nNo ini entry for one or more Channels. Using defaults for missing items."));
-
-	if (CS_USING_DEFAULT_TRIGGER_DATA & i32Status)
-		_ftprintf(stdout, _T("\nNo ini entry for one or more Triggers. Using defaults for missing items."));
-
-
-	// Load application specific information from the ini file
-	i32Status = LoadStmConfiguration(szIniFile, &g_StreamConfig);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-	if (0 != g_StreamConfig.DataPackCfg)
-	{
-		_ftprintf(stdout, _T("\nThis program does not support packed data. Resetting to unpacked mode."));
-		g_StreamConfig.DataPackCfg = 0;
-	}
-	if (CS_USING_DEFAULTS == i32Status)
-	{
-		_ftprintf(stdout, _T("\nNo ini entry for Stm configuration. Using defaults."));
-	}
-
-	// Load GPU specific information from the ini file
-	i32Status = LoadGpuConfiguration(szIniFile, &g_GpuConfig);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-	if (CS_USING_DEFAULTS == i32Status)
-	{
-		_ftprintf(stdout, _T("\nNo ini entry for Gpu configuration. Using defaults."));
-	}
-
-	// Load Experiment specific information from the ini file
-	i32Status = LoadExperimentConfiguration(szIniFile, &g_ExpConfig);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-	if (CS_USING_DEFAULTS == i32Status)
-	{
-		_ftprintf(stdout, _T("\nNo ini entry for Experiment configuration. Using defaults."));
-	}
-
-
-	// if we're not doing analysis then we're not using the GPU
-	if (!g_GpuConfig.bDoAnalysis)
-	{
-		g_GpuConfig.bUseGpu = FALSE;
-	}
-
-	// bUseGpu being true implies that we're doing analysis
-	if (g_GpuConfig.bUseGpu)
-	{
-		// Initialize cuda device.  If i32MaxBlocks or i32MaxThreadsPerBlock were -1 we set them to the maximum
-		cudaStatus = InitializeCudaDevice(i32CudaDevice, &i32MaxBlocks, &i32MaxThreadsPerBlock, &bPinGenericMemory);
-		if (cudaStatus != cudaSuccess)
-		{
-			fprintf(stderr, "\ncuda error %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			return (-1);
-		}
-		// our streaming uses a buffer allocated by our kernel driver, so we need to be able to map it
-		// onto the GPU using cudaHostRegister and cudaGetDevicePointer
-		if (!bPinGenericMemory)
-		{
-			fprintf(stderr, "\nPinned generic memory is needed for streaming but is not available.\nExiting program\n");
-			CsFreeSystem(g_hSystem);
-			return (-1);
-		}
-
-		if (g_GpuConfig.i32GpuBlocks > i32MaxBlocks || -1 == g_GpuConfig.i32GpuBlocks)
-		{
-			fprintf(stderr, "\nBlock count is too big, changed from %d blocks to %d blocks\n", g_GpuConfig.i32GpuBlocks, i32MaxBlocks);
-			g_GpuConfig.i32GpuBlocks = i32MaxBlocks;
-		}
-		if (-1 == g_GpuConfig.i32GpuBlocks) // -1 means use the maximum
-		{
-			g_GpuConfig.i32GpuBlocks = i32MaxBlocks;
-		}
-		if (g_GpuConfig.i32GpuThreads > i32MaxThreadsPerBlock)
-		{
-			fprintf(stderr, "\nThreads per block is too big, changed from %d threads to %d threads\n", g_GpuConfig.i32GpuThreads, i32MaxThreadsPerBlock);
-			g_GpuConfig.i32GpuThreads = i32MaxThreadsPerBlock;
-		}
-		if (-1 == g_GpuConfig.i32GpuThreads) // -1 means use the maximum
-		{
-			g_GpuConfig.i32GpuThreads = i32MaxThreadsPerBlock;
-		}
-		if (0 == g_GpuConfig.i32GpuThreads)
-		{
-			_ftprintf(stderr, "\nGPU thread count cannot be 0, changed to 1\n");
-			g_GpuConfig.i32GpuThreads = 1;
-		}
-	}
-
-	// Streaming Configuration.
-	// Validate if the board supports hardware streaming. If  it is not supported, 
-	// we'll exit gracefully.
-	i32Status = InitializeStream(g_hSystem);
-	if (CS_FAILED(i32Status))
-	{
-		// Error string was displayed in InitializeStream
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-	// Prepare streaming by deleting all existing data file that have the same file name
-	if (0 == Prepare_Cleanup())
-	{
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-
-	// Create events for stream data acquisition
-	g_hStreamStarted = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hStreamAbort = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hStreamError = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hThreadReadyForStream = CreateEvent(NULL, FALSE, FALSE, NULL);
-	if (NULL == g_hStreamStarted || NULL == g_hStreamAbort || NULL == g_hStreamError || NULL == g_hThreadReadyForStream)
-	{
-		_ftprintf(stderr, _T("\nUnable to create events for synchronization.\n"));
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-	// Commit the values to the driver.  This is where the values get sent to the
-	// hardware.  Any invalid parameters will be caught here and an error returned.
-	i32Status = CsDo(g_hSystem, ACTION_COMMIT);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-	// After ACTION_COMMIT, the sample size may change.
-	// Get user's acquisition data to use for various parameters for transfer
-	g_CsAcqCfg.u32Size = sizeof(CSACQUISITIONCONFIG);
-	i32Status = CsGet(g_hSystem, CS_ACQUISITION, CS_CURRENT_CONFIGURATION, &g_CsAcqCfg);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-	// Get the total amount of data we expect to receive.
-	// We can get this value from driver or calculate the following formula
-	// g_llTotalSamplesConfig = (g_CsAcqCfg.i64SegmentSize + SegmentTail_Size) * (g_CsAcqCfg.u32Mode&CS_MASKED_MODE) * g_CsAcqCfg.u32SegmentCount;
-
-	i32Status = CsGet(g_hSystem, 0, CS_STREAM_TOTALDATA_SIZE_BYTES, &g_llTotalSamplesConfig);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-	// Convert to number of samples
-	if (-1 != g_llTotalSamplesConfig)
-		g_llTotalSamplesConfig /= g_CsAcqCfg.u32SampleSize;
-
-	printf("\n The Board Count: %u\n", CsSysInfo.u32BoardCount);
-	//  Create threads for Stream. In M/S system, we have to create one thread per card
-	for (n = 1, i = 0; n <= CsSysInfo.u32BoardCount; n++, i++)
-	{
-		g_hThread[i] = (HANDLE)CreateThread(NULL, 0, CardStreamThread, &n, 0, &dwThreadId);
-		if ((HANDLE)(INT_PTR)-1 == g_hThread[i])
-		{
-			// Fail to create the streaming thread for the n card.
-			// Set the event g_hStreamAbort to terminate all threads
-			SetEvent(g_hStreamAbort);
-			_ftprintf(stderr, _T("\nUnable to create thread for card %d."), n);
-			CsFreeSystem(g_hSystem);
-			return (-1);
-		}
-		else
-		{
-			// Wait for the event g_hThreadReadyForStream to make sure that the thread was successfully created and are ready for stream
-			if (WAIT_TIMEOUT == WaitForSingleObject(g_hThreadReadyForStream, 10000))
-			{
-				// Something is wrong. It is not suppose to take that long
-				// Set the event g_hStreamAbort to terminate all threads
-				_ftprintf(stderr, _T("\nThread initialization error on card %d."), n);
-				SetEvent(g_hStreamAbort);
-				CsFreeSystem(g_hSystem);
-				return (-1);
-			}
-		}
-	}
-
-	// Start the streaming data acquisition
-	printf("\nStart streaming. Press ESC to abort\n\n");
-	i32Status = CsDo(g_hSystem, ACTION_START);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem);
-		return (-1);
-	}
-
-	u32TickStart = u32TickNow = GetTickCount();
-
-	// Set the event g_hStreamStarted so that the other threads can start to transfer data
-	Sleep(g_StreamConfig.u32DelayStartTransfer);		// Only for debug
-	SetEvent(g_hStreamStarted);
-
-	pre_current_time = clock();
-	pre_time = ((double)(pre_current_time - pre_start_time)) / CLOCKS_PER_SEC * 1000;
-	printf("Prepare Time: %.2f ms\n", pre_time);
-
-
-	// Loop until either we've done the number of segments we want, or
-	// the ESC key was pressed to abort.
-	while (!bDone)
-	{
-		// Are we being asked to quit? 
-		if (_kbhit())
-		{
-			switch (toupper(_getch()))
-			{
-			case 27:			// ESC key -> abort
-				SetEvent(g_hStreamAbort);
-				bDone = TRUE;
-				break;
-			case 'F':			// F key -> force trigger
-				i32Status = CsDo(g_hSystem, ACTION_FORCE);
-				if (CS_FAILED(i32Status))
-					DisplayErrorString(i32Status);
-			default:
-				MessageBeep(MB_ICONHAND);
-				break;
-			}
-		}
-		// Quit if elapsed time greater than our setting. 
-		if (u32TickNow - u32TickStart >= g_StreamConfig.u32TimeCounter)
-		{
-			SetEvent(g_hStreamAbort);
-			bDone = TRUE;
-		}
-
-		dwWaitStatus = WaitForMultipleObjects(CsSysInfo.u32BoardCount, g_hThread, TRUE, 1000);
-		if (WAIT_OBJECT_0 == dwWaitStatus)
-		{
-			// All Streaming threads have terminated
-			bDone = TRUE;
-		}
-
-		u32TickNow = GetTickCount();
-
-		// Calcaulate the sum of all data received so far
-		llSystemTotalData = 0;
-		for (i = 0; i < CsSysInfo.u32BoardCount; i++)
-		{
-			llSystemTotalData += g_llCardTotalData[i];
-		}
-
-		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize, NULL);
-	}
-
-	//	Abort the current acquisition 
-	CsDo(g_hSystem, ACTION_ABORT);
-
-	// Free the CompuScope system and any resources it's been using
-	i32Status = CsFreeSystem(g_hSystem);
-
-	if (g_GpuConfig.bUseGpu)
-	{
-		// cudaDeviceReset must be called before exiting in order for profiling and
-		// tracing tools such as Nsight and Visual Profiler to show complete traces.
-		// We're doing it here because if we don't we can't access the buffer in unpinned mode.
-		cudaStatus = cudaDeviceReset();
-		if (cudaStatus != cudaSuccess)
-		{
-			fprintf(stderr, "cudaDeviceReset failed!");
-			return 1;
-		}
-	}
-
-	// Check some events to see if there was any errors
-	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError, 0))
-	{
-		_ftprintf(stdout, _T("\nStream aborted on error.\n"));
-	}
-	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort, 0))
-	{
-		_ftprintf(stdout, _T("\nStream aborted by user.\n"));
-	}
-	else
-	{
-		_ftprintf(stdout, _T("\n\nStream has finished %u segments.\n"), g_CsAcqCfg.u32SegmentCount);
-	}
-
-	dTotalData = 1.0 * llSystemTotalData / 1000000.0;		// Million BYTES or million WORDs depending on CompuScope cards
-
-	if (bStreamPackedSupported)
-		printf("\nTotal data in '%d-bit' samples: %0.2f MS\n", g_DataFormatInfo.u32SampleSize_Bits, dTotalData * g_CsSysInfo.u32SampleSize * 8 / g_DataFormatInfo.u32SampleSize_Bits);
-	else
-		printf("\nTotal data in '%d-bit' samples: %0.2f MS\n", 8 * g_CsAcqCfg.u32SampleSize, dTotalData);
-
-	if (g_GpuConfig.bDoAnalysis)
-	{
-		long long llSystemTotalData = 0;
-		double dSystemTotalTime = 0.;
-
-		for (i = 0; i < CsSysInfo.u32BoardCount; i++)
-		{
-			llSystemTotalData += g_llCardTotalData[i];
-			dSystemTotalTime += diff_time[i];
-		}
-
-		if (display_result==1) {
-			DisplayResults(1,
-				g_GpuConfig.bUseGpu,
-				g_CsAcqCfg.u32Mode & CS_MASKED_MODE, // mask of the constant that loaded the expert firmware
-				g_CsAcqCfg.u32SegmentCount,
-				llSystemTotalData,
-				g_CsAcqCfg.u32SampleSize,
-				g_GpuConfig.u32SkipFactor,
-				dSystemTotalTime,
-				g_GpuConfig.strResultFile,
-				"profile.txt"); // Added profile file name
-		}
-
-		FILE* AnalysisFile = fopen("Analysis.txt", "a");
-		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData* g_CsSysInfo.u32SampleSize, AnalysisFile);
-	}
-
-
+	VirtualFree(phThread, 0, MEM_RELEASE);
+	VirtualFree(phSystem, 0, MEM_RELEASE);
 	return 0;
 }
+
+// --- NEW: one worker per system ---
+//DWORD WINAPI StreamSystemThread(void* p)
+//{
+//	THREADSTRUCT* T = (THREADSTRUCT*)p;            // from _tmain
+//	CSHANDLE hSystem = T->hSystem;
+//	const TCHAR* ini = T->lpFilename;
+//	int sysId = T->Sys;
+//
+//	int32  i32Status = CS_SUCCESS;
+//	uInt32 u32Mode = 0;
+//
+//	// --- Per-system locals (avoid g_* where possible) ---
+//	CSSYSTEMINFO        CsSysInfo;   ZeroMemory(&CsSysInfo, sizeof(CsSysInfo)); CsSysInfo.u32Size = sizeof(CSSYSTEMINFO);
+//	CSACQUISITIONCONFIG AcqCfg;      ZeroMemory(&AcqCfg, sizeof(AcqCfg));     AcqCfg.u32Size = sizeof(CSACQUISITIONCONFIG);
+//
+//	// If you still must use globals (g_*), they are per-process! Safer: clone them per system.
+//	// For minimal change, you may keep your existing g_* BUT you cannot run two systems in parallel safely.
+//	// Recommended: migrate g_* to locals like above over time.
+//
+//	// 1) System info
+//	i32Status = CsGetSystemInfo(hSystem, &CsSysInfo);
+//	if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//	_tprintf(_T("\n[Sys%d] %s  Boards=%u  Ch=%u"), sysId, CsSysInfo.strBoardName, CsSysInfo.u32BoardCount, CsSysInfo.u32ChannelCount);
+//
+//	// 2) Configure from INI (same INI for all systems)
+//	i32Status = CsAs_ConfigureSystem(hSystem, (int)CsSysInfo.u32ChannelCount, 1, ini, &u32Mode);
+//	if (CS_FAILED(i32Status) && i32Status != CS_INVALID_FILENAME) { DisplayErrorString(i32Status); goto CLEANUP; }
+//	if (i32Status & CS_USING_DEFAULT_ACQ_DATA)     _tprintf(_T("\n[Sys%d] No ini entry for acquisition. Using defaults."), sysId);
+//	if (i32Status & CS_USING_DEFAULT_CHANNEL_DATA) _tprintf(_T("\n[Sys%d] No ini entry for one or more Channels. Using defaults."), sysId);
+//	if (i32Status & CS_USING_DEFAULT_TRIGGER_DATA) _tprintf(_T("\n[Sys%d] No ini entry for one or more Triggers. Using defaults."), sysId);
+//
+//	// 3) Load your app configs (you already have these helpers)
+//	// If these fill globals (g_StreamConfig, g_GpuConfig, g_ExpConfig), be aware of cross-system races.
+//	i32Status = LoadStmConfiguration(ini, &g_StreamConfig);   if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//	i32Status = LoadGpuConfiguration(ini, &g_GpuConfig);      if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//	i32Status = LoadExperimentConfiguration(ini, &g_ExpConfig); if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//
+//	// 3a) Ensure unique base filename per system to avoid collisions
+//	{
+//		TCHAR base[MAX_PATH]; _tcscpy(base, g_StreamConfig.strResultFile);
+//		_stprintf(g_StreamConfig.strResultFile, _T("%s_Sys%d"), base, sysId);
+//	}
+//
+//	// 4) Initialize stream & prepare files/buffers
+//	i32Status = InitializeStream(hSystem); if (CS_FAILED(i32Status)) goto CLEANUP;
+//	if (0 == Prepare_Cleanup()) goto CLEANUP;
+//
+//	// 5) Create per-system events (use your globals if you must, but per-system is safer)
+//	g_hStreamStarted = CreateEvent(NULL, TRUE, FALSE, NULL);
+//	g_hStreamAbort = CreateEvent(NULL, TRUE, FALSE, NULL);
+//	g_hStreamError = CreateEvent(NULL, TRUE, FALSE, NULL);
+//	g_hThreadReadyForStream = CreateEvent(NULL, FALSE, FALSE, NULL);
+//	if (!g_hStreamStarted || !g_hStreamAbort || !g_hStreamError || !g_hThreadReadyForStream) { _tprintf(_T("\n[Sys%d] Event creation failed"), sysId); goto CLEANUP; }
+//
+//	// 6) Commit & read current config
+//	i32Status = CsDo(hSystem, ACTION_COMMIT); if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//	i32Status = CsGet(hSystem, CS_ACQUISITION, CS_CURRENT_CONFIGURATION, &AcqCfg); if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//
+//	// 7) --- REUSE YOUR PER-CARD LOOP (fixed: unique arg per thread) ---
+//	{
+//		DWORD  dwThreadId;
+//		uInt16 n, i;
+//		_tprintf(_T("\n[Sys%d] Creating %u card thread(s)"), sysId, CsSysInfo.u32BoardCount);
+//
+//		for (n = 1, i = 0; n <= CsSysInfo.u32BoardCount; ++n, ++i) {
+//			CARD_ARG* arg = (CARD_ARG*)malloc(sizeof * arg);
+//			if (!arg) { _tprintf(_T("\n[Sys%d] OOM on card %u"), sysId, n); SetEvent(g_hStreamAbort); break; }
+//			arg->hSystem = hSystem;  // <-- pass THIS system handle (no globals)
+//			arg->cardIndex = n;
+//			arg->sysId = sysId;        // pass the system id if you have it
+//			g_hThread[i] = CreateThread(NULL, 0, CardStreamThread, arg, 0, &dwThreadId);
+//			if (!g_hThread[i]) {
+//				_tprintf(_T("\n[Sys%d] CreateThread failed on card %u"), sysId, n);
+//				free(arg);
+//				SetEvent(g_hStreamAbort);
+//				break;
+//			}
+//			// Wait for per-card ready (you already had this)
+//			if (WAIT_OBJECT_0 != WaitForSingleObject(g_hThreadReadyForStream, 10000)) {
+//				_tprintf(_T("\n[Sys%d] Card %u thread not ready in time"), sysId, n);
+//				SetEvent(g_hStreamAbort);
+//				break;
+//			}
+//		}
+//	}
+//
+//	// 8) Start and notify card threads
+//	_tprintf(_T("\n[Sys%d] Start streaming. ESC aborts this system."), sysId);
+//	i32Status = CsDo(hSystem, ACTION_START); if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+//	Sleep(g_StreamConfig.u32DelayStartTransfer);
+//	SetEvent(g_hStreamStarted);
+//
+//	// 9) Your existing ESC/timeout/progress loop can be reused here (but scope it per system!)
+//	//    Tip: if your loop reads g_llCardTotalData, keep in mind it's global and shared.
+//
+//	// 10) Join card threads when done (you already have WaitForMultipleObjects)
+//	//     Use CsSysInfo.u32BoardCount and g_hThread[] you filled above.
+//
+//CLEANUP:
+//	CsDo(hSystem, ACTION_ABORT);
+//	CsFreeSystem(hSystem);
+//	free(T);  // <-- free the per-system arg allocated in _tmain
+//	return 0;
+//}
+
+// Define this near top of file while testing; remove later.
+#define BREAKPOINT_TEST 1
+
+DWORD WINAPI StreamSystemThread(void* p)
+{
+	THREADSTRUCT* T = (THREADSTRUCT*)p;
+	CSHANDLE hSystem = T->hSystem;      // per-system handle
+	int      sysId = T->Sys;          // 1-based system id
+	LPCTSTR  ini = T->lpFilename;   // SAME "System.ini" for both
+	free(T);                            // no longer needed below
+
+	int32  i32Status = CS_SUCCESS;
+	uInt32 u32Mode = 0;
+
+	CSSYSTEMINFO CsSysInfo; ZeroMemory(&CsSysInfo, sizeof(CsSysInfo));
+	CsSysInfo.u32Size = sizeof(CSSYSTEMINFO);
+
+	// --- Step 1: Identify system (breakpoint here to verify sysId & board model) ---
+	i32Status = CsGetSystemInfo(hSystem, &CsSysInfo);
+	if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+	_tprintf(_T("[Sys%d] %s  Boards=%u  Ch=%u\n"),
+		sysId, CsSysInfo.strBoardName, CsSysInfo.u32BoardCount, CsSysInfo.u32ChannelCount);
+
+	// --- Step 2: Configure from SAME INI (no streaming yet) ---
+	i32Status = CsAs_ConfigureSystem(
+		hSystem,
+		(int)CsSysInfo.u32ChannelCount, // configure all channels per system
+		1,                              // trigger count (adjust if you need more)
+		ini,
+		&u32Mode
+	);
+	// Breakpoint here: check i32Status; if CS_USING_DEFAULT_* bits set that's OK for this test
+	if (CS_FAILED(i32Status) && i32Status != CS_INVALID_FILENAME) {
+		DisplayErrorString(i32Status);
+		goto CLEANUP;
+	}
+
+	// Optional: print “using defaults” notes
+	if (i32Status & CS_USING_DEFAULT_ACQ_DATA)     _tprintf(_T("[Sys%d] Using default ACQ.\n"), sysId);
+	if (i32Status & CS_USING_DEFAULT_CHANNEL_DATA) _tprintf(_T("[Sys%d] Using default CHANNEL.\n"), sysId);
+	if (i32Status & CS_USING_DEFAULT_TRIGGER_DATA) _tprintf(_T("[Sys%d] Using default TRIGGER.\n"), sysId);
+
+	// --- Step 3: Commit to hardware (another good breakpoint) ---
+	i32Status = CsDo(hSystem, ACTION_COMMIT);
+	if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+
+#if BREAKPOINT_TEST
+	// --- Step 4: (TEST MODE) Abort immediately and return ---
+	_tprintf(_T("[Sys%d] Commit OK. Aborting immediately (breakpoint test).\n"), sysId);
+	CsDo(hSystem, ACTION_ABORT);
+	goto CLEANUP;
+#else
+	// Normal path (disabled in test): you would create per-card threads, start, etc.
+	// ...
+#endif
+
+CLEANUP:
+	CsFreeSystem(hSystem);
+	return 0;
+}
+
+
 
 /***************************************************************************************************
 ****************************************************************************************************/
@@ -1029,9 +819,15 @@ cudaError_t InitializeCudaDevice(int32 nDevice, int32* i32MaxBlocks, int32* i32M
 /***************************************************************************************************
 ****************************************************************************************************/
 
-DWORD WINAPI CardStreamThread(void* CardIndex)
+DWORD WINAPI CardStreamThread(void* p)
 {
-	uInt16 nCardIndex = *((uInt16*)CardIndex);
+
+	CARD_ARG* a = (CARD_ARG*)p;
+	CSHANDLE hSys = a->hSystem;      // <-- LOCAL system handle for this thread
+	uInt16   nCardIndex = a->cardIndex;
+	int      sysId = a->sysId;       // (optional)
+	free(a);                         // we own the arg; free it now
+
 	void* pBuffer1 = NULL;
 	void* pBuffer2 = NULL;
 
@@ -1176,7 +972,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 	_ftprintf(stderr, _T("\n(Actual buffer size used for data streaming = %u Bytes)\n"), g_StreamConfig.u32BufferSizeBytes);
 
-	i32Status = CsStmAllocateBuffer(g_hSystem, nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer1);			
+	i32Status = CsStmAllocateBuffer(hSys, /*card*/1, g_StreamConfig.u32BufferSizeBytes, &pBuffer1);
 	if (CS_FAILED(i32Status))
 	{
 		_ftprintf(stderr, _T("\nUnable to allocate memory for stream buffer 1.\n"));
@@ -1185,11 +981,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		ExitThread(1);
 	}
 
-	i32Status = CsStmAllocateBuffer(g_hSystem, nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer2);
+	i32Status = CsStmAllocateBuffer(hSys, /*card*/2, g_StreamConfig.u32BufferSizeBytes, &pBuffer2);
 	if (CS_FAILED(i32Status))
 	{
 		_ftprintf(stderr, _T("\nUnable to allocate memory for stream buffer 2.\n"));
-		CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer1);
+		CsStmFreeBuffer(hSys, /*card*/2, pBuffer1);
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(1);
@@ -1203,8 +999,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostRegister failed! Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer1);
+			CsFreeSystem(hSys);
+			CsStmFreeBuffer(hSys, /*card*/1, pBuffer1);
 			return cudaStatus;
 		}
 		h_buffer2 = (unsigned char*)ALIGN_UP(pBuffer2, MEMORY_ALIGNMENT);
@@ -1212,8 +1008,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostRegister failed! Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer2);
+			CsFreeSystem(hSys);
+			CsStmFreeBuffer(hSys, /*card*/2, pBuffer2);
 			cudaHostUnregister(h_buffer1);
 			return cudaStatus;
 		}
@@ -1221,8 +1017,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostGetDevicePointer failed!  Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer1);
+			CsFreeSystem(hSys);
+			CsStmFreeBuffer(hSys, /*card*/1, pBuffer1);
 			cudaHostUnregister(h_buffer1);
 			cudaHostUnregister(h_buffer2);
 			return cudaStatus;
@@ -1231,8 +1027,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostGetDevicePointer failed!  Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer2);
+			CsFreeSystem(hSys);
+			CsStmFreeBuffer(hSys, /*card*/2, pBuffer2);
 			cudaHostUnregister(h_buffer1);
 			cudaHostUnregister(h_buffer2);
 			return cudaStatus;
@@ -1253,8 +1049,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if ((WAIT_OBJECT_0 + 1) == dwWaitStatus)
 		{
 			// Aborted from user or error
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer1);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer2);
+			CsStmFreeBuffer(hSys, /*card*/1, pBuffer1);
+			CsStmFreeBuffer(hSys, /*card*/2, pBuffer2);
 			CloseHandle(hFile);
 			if (g_GpuConfig.bUseGpu)
 			{
@@ -1454,7 +1250,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				QueryPerformanceCounter(&transfer_start_time);  // mark the start time of data transfer and processing
 
 			
-			i32Status = CsStmTransferToBuffer(g_hSystem, nCardIndex, pCurrentBuffer, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
+			i32Status = CsStmTransferToBuffer(hSys, /*card*/1, pCurrentBuffer, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
 			
 
 			if (CS_FAILED(i32Status))
@@ -1578,7 +1374,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			
 			// Wait for the DMA transfer on the current buffer to complete so we can loop back around to start a new one.
 			// The calling thread will sleep until the transfer completes
-			i32Status = CsStmGetTransferStatus(g_hSystem, nCardIndex, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength, &u8EndOfData);
+			i32Status = CsStmGetTransferStatus(hSys, nCardIndex, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength, &u8EndOfData);
 
 
 			if (timer ==TRUE) {
@@ -1721,8 +1517,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			cudaHostUnregister(h_buffer1);
 			cudaHostUnregister(h_buffer2);
 		}
-		CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer1);
-		CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer2);
+		CsStmFreeBuffer(hSys, nCardIndex, pBuffer1);
+		CsStmFreeBuffer(hSys, nCardIndex, pBuffer2);
 
 		// Free the memory on the GPU and CPU, and destroy the cuBLAS handle
 		free(h_odata);
