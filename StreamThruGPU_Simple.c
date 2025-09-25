@@ -122,6 +122,9 @@ int32 LoadStmConfiguration(LPCTSTR szIniFile, PCSSTMCONFIG pConfig);
 // forward declarations
 DWORD WINAPI StreamSystemThread(void* p);
 DWORD WINAPI CardStreamThread(void* p);
+static void PrintSystemConfig(CSHANDLE hSystem, int sysId);
+static void PrintTwoBoardConfig(CSHANDLE hSystem, int sysId);
+
 BOOL Prepare_Cleanup();
 
 #ifdef __cplusplus
@@ -385,6 +388,8 @@ int _tmain(void)
 //	return 0;
 //}
 
+
+
 // Define this near top of file while testing; remove later.
 #define BREAKPOINT_TEST 1
 
@@ -431,6 +436,10 @@ DWORD WINAPI StreamSystemThread(void* p)
 	i32Status = CsDo(hSystem, ACTION_COMMIT);
 	if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
 
+	// Dump what the driver actually applied:
+	PrintTwoBoardConfig(hSystem, sysId);
+
+
 #if BREAKPOINT_TEST
 	// --- Step 4: (TEST MODE) Abort immediately and return ---
 	_tprintf(_T("[Sys%d] Commit OK. Aborting immediately (breakpoint test).\n"), sysId);
@@ -444,6 +453,144 @@ DWORD WINAPI StreamSystemThread(void* p)
 CLEANUP:
 	CsFreeSystem(hSystem);
 	return 0;
+}
+
+// Safe channel fetch: try 1-based then 0-based
+static int GetChannelCurrent(CSHANDLE hSystem, uInt32 ch1based, CSCHANNELCONFIG* out)
+{
+	int32 st;
+	ZeroMemory(out, sizeof * out);
+	out->u32Size = sizeof * out;
+	st = CsGet(hSystem, CS_CHANNEL, CS_CURRENT_CONFIGURATION, out, ch1based);
+	if (CS_FAILED(st)) {
+		uInt32 ch0 = (ch1based ? ch1based - 1 : 0);
+		st = CsGet(hSystem, CS_CHANNEL, CS_CURRENT_CONFIGURATION, out, ch0);
+	}
+	return CS_FAILED(st) ? 0 : 1;
+}
+
+// Print only: acquisition + CH1 + CH2 (and optional Trigger)
+void PrintTwoBoardConfig(CSHANDLE hSystem, int sysId)
+{
+	int32 st;
+
+	CSSYSTEMINFO si = { 0 }; si.u32Size = sizeof(si);
+	st = CsGetSystemInfo(hSystem, &si);
+	if (CS_FAILED(st)) { DisplayErrorString(st); return; }
+
+	CSACQUISITIONCONFIG acq = { 0 }; acq.u32Size = sizeof(acq);
+	st = CsGet(hSystem, CS_ACQUISITION, CS_CURRENT_CONFIGURATION, &acq);
+	if (CS_FAILED(st)) { DisplayErrorString(st); return; }
+
+	_tprintf(_T("\n===========================\n"));
+	_tprintf(_T("[Sys%d] Applied acquisition\n"), sysId);
+	_tprintf(_T("  BoardName          : %s\n"), si.strBoardName);
+	_tprintf(_T("  Boards/Channels    : %u / %u\n"), si.u32BoardCount, si.u32ChannelCount);
+	_tprintf(_T("  Mode (masked)      : 0x%08X\n"), (acq.u32Mode & CS_MASKED_MODE));
+	_tprintf(_T("  SampleSize (bytes) : %d\n"), acq.u32SampleSize);
+	_tprintf(_T("  SampleRate (Hz)    : %d\n"), acq.i64SampleRate);
+	_tprintf(_T("  SegmentSize (S)    : %lld\n"), (long long)acq.i64SegmentSize);
+	_tprintf(_T("  SegmentCount       : %u\n"), acq.u32SegmentCount);
+	_tprintf(_T("  TriggerTimeout (S) : %d\n"), acq.i64TriggerTimeout);
+
+	// Only CH1 and CH2
+	for (uInt32 ch = 1; ch <= 2; ++ch) {
+		CSCHANNELCONFIG cc;
+		if (!GetChannelCurrent(hSystem, ch, &cc)) {
+			_tprintf(_T("[Sys%d] CH%u : <Invalid channel index>\n"), sysId, ch);
+			continue;
+		}
+		_tprintf(_T("[Sys%d] CH%u\n"), sysId, ch);
+		_tprintf(_T("  Range (V)          : %.3f\n"), cc.u32InputRange);
+		_tprintf(_T("  Coupling           : %u\n"), cc.u32Term);   // e.g., DC/AC enum
+		_tprintf(_T("  Impedance (Ohm)    : %u\n"), cc.u32Impedance);  // e.g., 50 / 1M
+		_tprintf(_T("  DcOffset (V)       : %.6f\n"), cc.i32DcOffset);
+		_tprintf(_T("  Filter             : %u\n"), cc.u32Filter);
+		_tprintf(_T("  Enabled            : %u\n"), cc.u32ChannelIndex);
+	}
+
+	// Optional: single trigger (try 1 then 0)
+	CSTRIGGERCONFIG tc = { 0 }; tc.u32Size = sizeof(tc);
+	st = CsGet(hSystem, CS_TRIGGER, CS_CURRENT_CONFIGURATION, &tc, 1);
+	if (CS_FAILED(st)) st = CsGet(hSystem, CS_TRIGGER, CS_CURRENT_CONFIGURATION, &tc, 0);
+	if (CS_FAILED(st)) {
+		_tprintf(_T("[Sys%d] <No trigger info>\n"), sysId);
+	}
+	else {
+		_tprintf(_T("[Sys%d] Trigger%u\n"), sysId);
+		_tprintf(_T("  Source             : %u\n"), tc.i32Source);       // e.g., CH1/EXT/Software
+		_tprintf(_T("  Level (%)          : %.6f\n"), tc.i32Level);
+		_tprintf(_T("  Slope              : %u\n"), tc.u32Condition);        // e.g., Rising/Falling
+		_tprintf(_T("  Coupling           : %u\n"), tc.u32ExtCoupling);
+		_tprintf(_T("  Filter             : %u\n"), tc.u32Filter);
+		_tprintf(_T("  Impedance (Ohms)   : %.6f\n"), tc.u32ExtImpedance);
+		_tprintf(_T("  TrigRange (mV)     : %u\n"), tc.u32ExtTriggerRange);
+	}
+	_tprintf(_T("===========================\n"));
+}
+
+
+static void PrintSystemConfig(CSHANDLE hSystem, int sysId)
+{
+	int32 st;
+	CSSYSTEMINFO        si;  si.u32Size = sizeof(si);
+	CSACQUISITIONCONFIG acq; acq.u32Size = sizeof(acq);
+
+	st = CsGetSystemInfo(hSystem, &si);
+	if (CS_FAILED(st)) { DisplayErrorString(st); return; }
+
+	// --- Acquisition (CURRENT) ---
+	st = CsGet(hSystem, CS_ACQUISITION, CS_CURRENT_CONFIGURATION, &acq);
+	if (CS_FAILED(st)) { DisplayErrorString(st); return; }
+
+	_tprintf(_T("\n===========================\n"));
+	_tprintf(_T("[Sys%d] Applied acquisition\n"), sysId);
+	_tprintf(_T("  BoardName          : %s\n"), si.strBoardName);
+	_tprintf(_T("  Boards/Channels    : %u / %u\n"), si.u32BoardCount, si.u32ChannelCount);
+	_tprintf(_T("  Mode (masked)      : 0x%08X\n"), (acq.u32Mode & CS_MASKED_MODE));
+	_tprintf(_T("  SampleSize (bytes) : %d\n"), acq.u32SampleSize);
+	_tprintf(_T("  SampleRate (Hz)    : %d\n"), acq.i64SampleRate);
+	_tprintf(_T("  SegmentSize (S)    : %lld\n"), (long long)acq.i64SegmentSize);
+	_tprintf(_T("  SegmentCount       : %u\n"), acq.u32SegmentCount);
+	_tprintf(_T("  TriggerTimeout (S) : %d\n"), acq.i64TriggerTimeout);
+
+
+	// --- Per-channel (CURRENT) ---
+	// NOTE: Channels are typically 1..si.u32ChannelCount across all boards.
+	for (uInt16 ch = 1; ch <= si.u32ChannelCount; ++ch)
+	{
+		CSCHANNELCONFIG cc; cc.u32Size = sizeof(cc);
+		st = CsGet(hSystem, CS_CHANNEL, CS_CURRENT_CONFIGURATION, &cc, ch);
+		if (CS_FAILED(st)) { DisplayErrorString(st); continue; }
+
+		_tprintf(_T("[Sys%d] CH%u\n"), sysId, ch);
+		_tprintf(_T("  Range (V)          : %.3f\n"), cc.u32InputRange);
+		_tprintf(_T("  Coupling           : %u\n"), cc.u32Term);   // e.g., DC/AC enum
+		_tprintf(_T("  Impedance (Ohm)    : %u\n"), cc.u32Impedance);  // e.g., 50 / 1M
+		_tprintf(_T("  DcOffset (V)       : %.6f\n"), cc.i32DcOffset);
+		_tprintf(_T("  Filter             : %u\n"), cc.u32Filter);
+		_tprintf(_T("  Enabled            : %u\n"), cc.u32ChannelIndex);
+	}
+
+	// --- Trigger (CURRENT) ---
+	// If you configured >1 trigger, loop over your configured trigger count.
+	for (uInt16 trig = 1; trig <= 1; ++trig)
+	{
+		CSTRIGGERCONFIG tc; tc.u32Size = sizeof(tc);
+		st = CsGet(hSystem, CS_TRIGGER, CS_CURRENT_CONFIGURATION, &tc, trig);
+		if (CS_FAILED(st)) { DisplayErrorString(st); continue; }
+
+		_tprintf(_T("[Sys%d] Trigger%u\n"), sysId, trig);
+		_tprintf(_T("  Source             : %u\n"), tc.i32Source);       // e.g., CH1/EXT/Software
+		_tprintf(_T("  Level (%)          : %.6f\n"), tc.i32Level);
+		_tprintf(_T("  Slope              : %u\n"), tc.u32Condition);        // e.g., Rising/Falling
+		_tprintf(_T("  Coupling           : %u\n"), tc.u32ExtCoupling);
+		_tprintf(_T("  Filter             : %u\n"), tc.u32Filter);
+		_tprintf(_T("  Impedance (Ohms)   : %.6f\n"), tc.u32ExtImpedance);
+		_tprintf(_T("  TrigRange (mV)     : %u\n"), tc.u32ExtTriggerRange);
+	}
+
+	_tprintf(_T("===========================\n"));
 }
 
 
