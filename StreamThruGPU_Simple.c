@@ -1,4 +1,4 @@
-/////////////////////////////////////////////////////////////////////////
+﻿/////////////////////////////////////////////////////////////////////////
 //
 // GageStreamThruGPU_Simple
 //
@@ -392,68 +392,72 @@ int _tmain(void)
 
 // Define this near top of file while testing; remove later.
 #define BREAKPOINT_TEST 1
-
 DWORD WINAPI StreamSystemThread(void* p)
 {
 	THREADSTRUCT* T = (THREADSTRUCT*)p;
-	CSHANDLE hSystem = T->hSystem;      // per-system handle
-	int      sysId = T->Sys;          // 1-based system id
-	LPCTSTR  ini = T->lpFilename;   // SAME "System.ini" for both
-	free(T);                            // no longer needed below
+	CSHANDLE hSystem = T->hSystem;
+	const TCHAR* ini = T->lpFilename;
+	int sysId = T->Sys;
 
-	int32  i32Status = CS_SUCCESS;
+	int32  st = CS_SUCCESS;
 	uInt32 u32Mode = 0;
 
-	CSSYSTEMINFO CsSysInfo; ZeroMemory(&CsSysInfo, sizeof(CsSysInfo));
-	CsSysInfo.u32Size = sizeof(CSSYSTEMINFO);
+	CSSYSTEMINFO si; ZeroMemory(&si, sizeof si); si.u32Size = sizeof si;
+	CSACQUISITIONCONFIG acq; ZeroMemory(&acq, sizeof acq); acq.u32Size = sizeof acq;
 
-	// --- Step 1: Identify system (breakpoint here to verify sysId & board model) ---
-	i32Status = CsGetSystemInfo(hSystem, &CsSysInfo);
-	if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
-	_tprintf(_T("[Sys%d] %s  Boards=%u  Ch=%u\n"),
-		sysId, CsSysInfo.strBoardName, CsSysInfo.u32BoardCount, CsSysInfo.u32ChannelCount);
+	// 1) System info
+	st = CsGetSystemInfo(hSystem, &si);
+	if (CS_FAILED(st)) { DisplayErrorString(st); goto CLEANUP; }
+	_tprintf(_T("\n[Sys%d] %s  Boards=%u  Ch=%u"), sysId, si.strBoardName, si.u32BoardCount, si.u32ChannelCount);
 
-	// --- Step 2: Configure from SAME INI (no streaming yet) ---
-	i32Status = CsAs_ConfigureSystem(
-		hSystem,
-		(int)CsSysInfo.u32ChannelCount, // configure all channels per system
-		1,                              // trigger count (adjust if you need more)
-		ini,
-		&u32Mode
-	);
-	// Breakpoint here: check i32Status; if CS_USING_DEFAULT_* bits set that's OK for this test
-	if (CS_FAILED(i32Status) && i32Status != CS_INVALID_FILENAME) {
-		DisplayErrorString(i32Status);
-		goto CLEANUP;
-	}
+	// 🔧 restore legacy expectations for helpers that read globals
+	g_CsSysInfo = si;
 
-	// Optional: print �using defaults� notes
-	if (i32Status & CS_USING_DEFAULT_ACQ_DATA)     _tprintf(_T("[Sys%d] Using default ACQ.\n"), sysId);
-	if (i32Status & CS_USING_DEFAULT_CHANNEL_DATA) _tprintf(_T("[Sys%d] Using default CHANNEL.\n"), sysId);
-	if (i32Status & CS_USING_DEFAULT_TRIGGER_DATA) _tprintf(_T("[Sys%d] Using default TRIGGER.\n"), sysId);
+	// 2) Load app configs (keeps original behavior that pooled INI into globals)
+	st = LoadStmConfiguration(ini, &g_StreamConfig);    if (CS_FAILED(st)) { DisplayErrorString(st); goto CLEANUP; }
+	st = LoadGpuConfiguration(ini, &g_GpuConfig);       if (CS_FAILED(st)) { DisplayErrorString(st); goto CLEANUP; }
+	st = LoadExperimentConfiguration(ini, &g_ExpConfig); if (CS_FAILED(st)) { DisplayErrorString(st); goto CLEANUP; }
+	if (g_StreamConfig.DataPackCfg) { _tprintf(_T("\n[Sys%d] Packed not supported; forcing unpacked."), sysId); g_StreamConfig.DataPackCfg = 0; }
+	if (!g_GpuConfig.bDoAnalysis) g_GpuConfig.bUseGpu = FALSE;
+	if (g_GpuConfig.i32GpuThreads == 0) g_GpuConfig.i32GpuThreads = 1;
 
-	// --- Step 3: Commit to hardware (another good breakpoint) ---
-	i32Status = CsDo(hSystem, ACTION_COMMIT);
-	if (CS_FAILED(i32Status)) { DisplayErrorString(i32Status); goto CLEANUP; }
+	// 3) Configure from INI using real trigger count
+	int trigCount = (int)CalculateTriggerCountFromConfig(&si, ini);
+	if (trigCount <= 0) trigCount = 1;
+	st = CsAs_ConfigureSystem(hSystem, (int)si.u32ChannelCount, trigCount, ini, &u32Mode);
+	_tprintf(_T("\n[Sys%d] CsAs_ConfigureSystem -> %d  mode=0x%08X"), sysId, (int)st, (unsigned)u32Mode);
+	if (CS_FAILED(st) && st != CS_INVALID_FILENAME) { DisplayErrorString(st); goto CLEANUP; }
+	if (st & CS_USING_DEFAULT_ACQ_DATA)     _tprintf(_T("\n[Sys%d] Using default ACQ."), sysId);
+	if (st & CS_USING_DEFAULT_CHANNEL_DATA) _tprintf(_T("\n[Sys%d] Using default CHANNEL."), sysId);
+	if (st & CS_USING_DEFAULT_TRIGGER_DATA) _tprintf(_T("\n[Sys%d] Using default TRIGGER."), sysId);
 
-	// Dump what the driver actually applied:
+	// 4) Commit to hardware
+	st = CsDo(hSystem, ACTION_COMMIT);
+	_tprintf(_T("\n[Sys%d] ACTION_COMMIT -> %d"), sysId, (int)st);
+	if (CS_FAILED(st)) { DisplayErrorString(st); goto CLEANUP; }
+
+	// 5) Read back CURRENT to populate globals some paths use
+	st = CsGet(hSystem, CS_ACQUISITION, CS_CURRENT_CONFIGURATION, &acq);
+	if (CS_FAILED(st)) { DisplayErrorString(st); goto CLEANUP; }
+	g_CsAcqCfg = acq; // keep legacy behavior
+
+	// 6) Show what actually applied (uses CURRENT)
 	PrintTwoBoardConfig(hSystem, sysId);
 
-
-#if BREAKPOINT_TEST
-	// --- Step 4: (TEST MODE) Abort immediately and return ---
-	_tprintf(_T("[Sys%d] Commit OK. Aborting immediately (breakpoint test).\n"), sysId);
+	// ✅ Breakpoint test ends here — no streaming, no threads
+	_tprintf(_T("\n[Sys%d] Commit OK. Aborting immediately (breakpoint test)."), sysId);
 	CsDo(hSystem, ACTION_ABORT);
 	goto CLEANUP;
-#else
-	// Normal path (disabled in test): you would create per-card threads, start, etc.
-	// ...
-#endif
+
+	// (When you enable streaming later, move the event creation + per-card threads
+	//  here, but make the events per-system to avoid cross-system collisions.)
 
 CLEANUP:
 	CsFreeSystem(hSystem);
+	free(T);
 	return 0;
 }
+
 
 // Safe channel fetch: try 1-based then 0-based
 static int GetChannelCurrent(CSHANDLE hSystem, uInt32 ch1based, CSCHANNELCONFIG* out)
