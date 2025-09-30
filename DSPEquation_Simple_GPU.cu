@@ -166,6 +166,7 @@ __global__ void divideG2Matrix(double* g2Matrix, double* d_reducedCorrMatrixA, d
 // Helper function for using CUDA to compute cross correlation.
 extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			// Loop count
 	short* data,																		// Input data
+	short* dataB,																		// Input data B, not used here
 	const __int64 size,																	// Size of the input data
 	const int totalThreads,																// Total number of threads
 	const int gridSize,																	// Thread Grid size

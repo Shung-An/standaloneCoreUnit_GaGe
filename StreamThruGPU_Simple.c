@@ -128,6 +128,7 @@ extern "C" {
 	extern cudaError_t ComputeCrossCorrelationGPU(
 		const __int64 u32LoopCount,			// Loop count
 		short* data,																		// Input data
+		short* dataB,																		// Input data B for cross correlation
 		const __int64 size,																	// Size of the input data
 		const int totalThreads,																// Total number of threads
 		const int gridSize,																	// Thread Grid size
@@ -202,14 +203,14 @@ void VerifyData(void* buffer, int64 size, unsigned int sample_size);
 
 
 // Global variables shared between threads
-HANDLE						g_hThread[MAX_CARDS_COUNT] = { 0 };
+HANDLE						g_hThread[2] = { 0 ,0};
 LONGLONG					g_llCardTotalData[MAX_CARDS_COUNT] = { 0 };
 LONGLONG					g_llTotalSamplesConfig = 0;
 HANDLE						g_hStreamStarted[2] = { 0,0 };
 HANDLE						g_hStreamAbort[2] = { 0,0 };
 HANDLE						g_hStreamError[2] = { 0,0 };
 HANDLE						g_hThreadReadyForStream[2] = {0,0};
-CSHANDLE					g_hSystem[2] = {0};
+CSHANDLE					g_hSystem[2] = {0,0};
 CSSYSTEMINFO				g_CsSysInfo = { 0 };
 CSACQUISITIONCONFIG			g_CsAcqCfg = { 0 };
 CSSTMCONFIG					g_StreamConfig = { 0 }; // Stream configuration
@@ -293,7 +294,7 @@ int _tmain()
 	g_CsSysInfo = CsSysInfo;
 
 	// Display the system name from the driver
-	_ftprintf(stdout, _T("\nBoard1 Name (SR): %s (%d)"),  CsSysInfo.strBoardName, g_hSystem[0]);
+	_ftprintf(stdout, _T("\nBoard1 Name (Handle): %s (%d)"),  CsSysInfo.strBoardName, g_hSystem[0]);
 
 
 	// Get System information. The u32Size field must be filled in
@@ -310,7 +311,7 @@ int _tmain()
 	g_CsSysInfo = CsSysInfo;
 
 	// Display the system name from the driver
-	_ftprintf(stdout, _T("\nBoard2 Name (SR): %s (%d)"), CsSysInfo.strBoardName, g_hSystem[1] );
+	_ftprintf(stdout, _T("\nBoard2 Name (Handle): %s (%d)"), CsSysInfo.strBoardName, g_hSystem[1] );
 
 
 	//	We are analysing the ini file to find the number of triggers
@@ -635,7 +636,7 @@ int _tmain()
 			bDone = TRUE;
 		}
 
-		dwWaitStatus = WaitForMultipleObjects(CsSysInfo.u32BoardCount, g_hThread, TRUE, 1000);
+		dwWaitStatus = WaitForMultipleObjects(2, g_hThread, TRUE, 1000);
 		if (WAIT_OBJECT_0 == dwWaitStatus)
 		{
 			// All Streaming threads have terminated
@@ -1100,6 +1101,9 @@ cudaError_t InitializeCudaDevice(int32 nDevice, int32* i32MaxBlocks, int32* i32M
 DWORD WINAPI CardStreamThread(void* CardIndex)
 {
 	uInt16 nCardIndex = *((uInt16*)CardIndex);
+
+
+
 	void* pBuffer11 = NULL; // Pointer to the buffer for card 1
 	void* pBuffer12 = NULL; // Pointer to the second buffer for card 1
 	void* pBuffer21 = NULL; // Pointer to the buffer for card 2
@@ -1151,7 +1155,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	BOOL				bDone = FALSE;
 	uInt32				u32LoopCount = 0;
 	uInt32				u32ErrorFlag = 0;
-	HANDLE				WaitEvents[4];
+	HANDLE				WaitEvents[2];
 	DWORD				dwWaitStatus;
 	DWORD				dwRetCode = 0;
 	DWORD				dwBytesSave = 0;
@@ -1159,8 +1163,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	BOOL				bWriteSuccess = TRUE;
 	DWORD				dwFileFlag = g_StreamConfig.bFileFlagNoBuffering ? FILE_FLAG_NO_BUFFERING : 0;
 	TCHAR				szSaveFileName[MAX_PATH];
-	uInt32				u32ActualLength = 0;
-	uInt8				u8EndOfData = 0;
+	uInt32				u32ActualLength1 = 0;
+	uInt32				u32ActualLength2 = 0;
+	uInt8				u8EndOfData1 = 0;
+	uInt8				u8EndOfData2 = 0;
 	BOOL				bStreamCompletedSuccess = FALSE;
 	cudaError_t			cudaStatus = 0;
 
@@ -1179,6 +1185,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	uInt32				totalSegNum;														// Total number of segments in the data transfer
 	int					corrMatrixSize; 													// Size of the correlation matrix
 	int					segmentSize;														// Size of one segment in the input data 
+
+	TCHAR msg[256] = { 0 };
 
 	HANDLE raw_signal_hPipe = NULL;
 
@@ -1256,6 +1264,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(1);
+		ExitThread(2);
 	}
 
 	i32Status = CsStmAllocateBuffer(g_hSystem[0], nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer12);
@@ -1266,6 +1275,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(1);
+		ExitThread(2);
 	}
 
 	i32Status = CsStmAllocateBuffer(g_hSystem[1], nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer21);
@@ -1277,6 +1287,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(2);
+		ExitThread(1);
 	}
 
 	i32Status = CsStmAllocateBuffer(g_hSystem[1], nCardIndex, g_StreamConfig.u32BufferSizeBytes, &pBuffer22);
@@ -1289,6 +1300,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(2);
+		ExitThread(1);
 	}
 
 
@@ -1378,16 +1390,17 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 		// So far so good ...
 		// Let the main thread know that this thread is ready for stream
-		SetEvent(g_hThreadReadyForStream[0]);
-		SetEvent(g_hThreadReadyForStream[1]);
+		SetEvent(g_hThreadReadyForStream);
+
 
 		// Wait for the start acquisition event from the main thread
-		WaitEvents[0] = g_hStreamStarted[0];
-		WaitEvents[1] = g_hStreamAbort[0];
-		WaitEvents[2] = g_hStreamStarted[1];
-		WaitEvents[3] = g_hStreamAbort[1];
+		WaitEvents[0] = g_hStreamStarted;
+		WaitEvents[1] = g_hStreamAbort;
 
-		dwWaitStatus = WaitForMultipleObjects(4, WaitEvents, FALSE, INFINITE);
+
+	
+
+		dwWaitStatus = WaitForMultipleObjects(2, WaitEvents, FALSE, INFINITE);
 
 		if ((WAIT_OBJECT_0 + 1) == dwWaitStatus)
 		{
@@ -1576,6 +1589,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError, 0))
 				break;
 
+
 			// Determine where new data transfer data will go. We alternate
 			// between our 2 streaming buffers. d_buffer is the pointer to the
 			// buffer on the GPU
@@ -1630,6 +1644,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						// perform cross correlation compute using GPU on the input data
 						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
 							(short*)d_buffer11,
+							(short*)d_buffer21,
 							u32TransferSizeSamples,
 							totalThreads,
 							gridSize,
@@ -1652,6 +1667,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						// perform g2 correlation compute using GPU on the input data
 						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
 							(short*)d_buffer11,
+							(short*)d_buffer21,
 							u32TransferSizeSamples,
 							totalThreads,
 							gridSize,
@@ -1723,8 +1739,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 			// Wait for the DMA transfer on the current buffer to complete so we can loop back around to start a new one.
 			// The calling thread will sleep until the transfer completes
-			i32Status = CsStmGetTransferStatus(g_hSystem[0], nCardIndex, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength, &u8EndOfData);
-			i32Status = CsStmGetTransferStatus(g_hSystem[1], nCardIndex, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength, &u8EndOfData);
+			i32Status = CsStmGetTransferStatus(g_hSystem[0], 1, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength1, &u8EndOfData1);
+			CsGetErrorString(i32Status, msg, _countof(msg));   // or your DisplayErrorString(i32Status)
+			_tprintf(_T("CsStmGetTransferStatus 1 returned %s\n"), msg);
+			i32Status = CsStmGetTransferStatus(g_hSystem[1], 1, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength2, &u8EndOfData2);
+			CsGetErrorString(i32Status, msg, _countof(msg));   // or your DisplayErrorString(i32Status)
+			_tprintf(_T("CsStmGetTransferStatus 2 returned %s\n"), msg);
 
 			if (timer == TRUE) {
 				QueryPerformanceCounter(&transfer_end_time);  // Mark the end time of data transfer and processing
@@ -1736,8 +1756,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			if (CS_SUCCEEDED(i32Status))
 			{
 				// Calculate the total of data transfered so far for this card
-				g_llCardTotalData[nCardIndex - 1] += u32ActualLength;//////////////////////////////////////////////////////////////////////////////////////////////////////////
-				bStreamCompletedSuccess = (0 != u8EndOfData);
+				g_llCardTotalData[nCardIndex - 1] += u32ActualLength1+ u32ActualLength2;//////////////////////////////////////////////////////////////////////////////////////////////////////////
+				bStreamCompletedSuccess = (0 != u8EndOfData1 && 0!= u8EndOfData2);
 
 				if (0 != u32ErrorFlag)
 				{
@@ -1834,7 +1854,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 		if (bStreamCompletedSuccess && g_StreamConfig.bSaveToFile && NULL != pWorkBuffer1)
 		{
-			u32WriteSize = u32ActualLength * g_CsSysInfo.u32SampleSize;
+			u32WriteSize = u32ActualLength1 * g_CsSysInfo.u32SampleSize;
 
 			//Apply a right padding with the sector size
 			if (g_StreamConfig.bFileFlagNoBuffering)
@@ -1843,8 +1863,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				u32WriteSize = ((u32WriteSize - 1) / u32SectorSize + 1) * u32SectorSize;
 
 				// clear padding bytes
-				if (u32WriteSize > u32ActualLength * g_CsSysInfo.u32SampleSize)
-					memset(&pBufTmp[u32ActualLength * g_CsSysInfo.u32SampleSize], 0, u32WriteSize - u32ActualLength * g_CsSysInfo.u32SampleSize);
+				if (u32WriteSize > u32ActualLength1 * g_CsSysInfo.u32SampleSize)
+					memset(&pBufTmp[u32ActualLength1 * g_CsSysInfo.u32SampleSize], 0, u32WriteSize - u32ActualLength1 * g_CsSysInfo.u32SampleSize);
 			}
 
 			// Save the data from pWorkBuffer to hard disk
