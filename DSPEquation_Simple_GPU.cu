@@ -233,6 +233,21 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	// Wait for the GPU to finish
 	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
 	 
+	size_t bytes = size * sizeof(int);        // or whatever type
+	short* h = (short*)malloc(bytes);       // host buffer
+
+	// copy device -> host (blocking)
+	cudaError_t err = cudaMemcpy(h, data, bytes, cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy D2H failed: %s\n", cudaGetErrorString(err));
+	}
+
+
+	for (int i = 0; i < 100; i++) {
+		printf("\n%d\t%d\t%d", i, h[i], (unsigned short)h[i]);
+	}
+
+
 	// Write results to Analysis file
 	if (AnalysisFile) {
 		fprintf(AnalysisFile, "%d\t", u32LoopCount);

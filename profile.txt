@@ -1,2 +1,0 @@
-Experiment: Experiment_1
-One Step Time: 4.78 ms, Transfer and process Time: 4.78 ms, GPU Process Time: 0.00 ms
