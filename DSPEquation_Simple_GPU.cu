@@ -10,6 +10,14 @@
 
 
 
+#define CHECK_CUDA(call)                                                \
+    do {                                                                \
+        cudaError_t err = call;                                         \
+        if (err != cudaSuccess) {                                       \
+            fprintf(stderr, "CUDA error %s:%d: %s\n",                   \
+                    __FILE__, __LINE__, cudaGetErrorString(err));       \
+        }                                                               \
+    } while (0)
 
 
 void checkCuda(cudaError_t result, const char* msg) {
@@ -42,14 +50,18 @@ __global__ void demodulationCrossCorrelation(short* data,
 {
 	
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
-	
+	int indexShareMemory = threadIdx.x/2;
 	// Declare shared memory
 	//__shared__ float sharedSegment[sharedSegmentSize]; 
 	extern __shared__ double sharedSegment[];
 	// load data into shared memory
-	if (threadIdx.x < sharedSegmentSize) {
-		sharedSegment[threadIdx.x] = static_cast<double>(data[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+	if (threadIdx.x < sharedSegmentSize && threadIdx.x%2==0) {
+		sharedSegment[threadIdx.x] = static_cast<double>(data[blockIdx.x * sharedSegmentSize + indexShareMemory]);
 	}
+	if (threadIdx.x < sharedSegmentSize && threadIdx.x % 2 == 1)	{
+		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + indexShareMemory]);
+	}
+
 
 	__syncthreads(); // Ensure all threads have loaded their data into shared memory
 
@@ -195,7 +207,7 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
 	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
-	
+
 
 	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
 	const int Nrows = corrMatrixSize;
