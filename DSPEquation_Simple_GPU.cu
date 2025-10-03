@@ -31,6 +31,7 @@ void checkCublas(cublasStatus_t result, const char* msg) {
 
 // Demodulation at 8 correlation matrix with shared memory, light version
 __global__ void demodulationCrossCorrelation(short* data, 
+												short* dataB,	
 												__int64 numElements, 
 												double* aggregatedCorrMatrix, 
 												const int sharedSegmentSize, 
@@ -71,7 +72,11 @@ __global__ void demodulationCrossCorrelation(short* data,
 
 
 
+
+
+
 __global__ void demodulationAutoCorrelation(short* data,
+	short* dataB,
 	__int64 numElements,
 	double* autoCorrelationMatrixA,
 	double* autoCorrelationMatrixB,
@@ -121,6 +126,7 @@ __global__ void demodulationAutoCorrelation(short* data,
 
 	}
 }
+
 
 
 
@@ -188,7 +194,7 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 
 
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
-	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
+	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
 	
 
 	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
@@ -237,6 +243,7 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 // Helper function for using CUDA to compute G2 correlation.
 extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,           // Loop count
 	short* data,                                                                     // Input data
+	short* dataB,                                                                     // Input data
 	const __int64 size,                                                              // Size of the input data
 	const int totalThreads,                                                          // Total number of threads
 	const int gridSize,                                                              // Thread Grid size
@@ -260,7 +267,7 @@ extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,      
 	cudaError_t cudaStatus = cudaSuccess; // Return status of CUDA functions
 
 	// Compute correlation matrices A and B using shared memory
-	demodulationAutoCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, size, d_correlationMatrixA, d_correlationMatrixB, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
+	demodulationAutoCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_correlationMatrixA, d_correlationMatrixB, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
 	
 	// Perform matrix-vector multiplication using cuBLAS for reducing the aggregated correlation matrix A
 	// 64 x N matrix-vector multiplication

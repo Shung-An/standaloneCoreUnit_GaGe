@@ -483,7 +483,8 @@ int _tmain()
 	// Prepare streaming by deleting all existing data file that have the same file name
 	if (0 == Prepare_Cleanup())
 	{
-		CsFreeSystem(g_hSystem);
+		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[0]);
 		return (-1);
 	}
 
@@ -551,8 +552,8 @@ int _tmain()
 	printf("\n The Board Count: %u\n", CsSysInfo.u32BoardCount);
 	//  Create threads for Stream. In M/S system, we have to create one thread per card
 	//for (n = 1, i = 0; n <= CsSysInfo.u32BoardCount; n++, i++)
-	// 2 cards only for now
-	for (n = 1, i = 0; n <= 2; n++, i++)
+	// 2 cards in the same CardStreamThread 
+	for (n = 1, i = 0; n <= 1; n++, i++)
 	{
 		g_hThread[i] = (HANDLE)CreateThread(NULL, 0, CardStreamThread, &n, 0, &dwThreadId);
 		if ((HANDLE)(INT_PTR)-1 == g_hThread[i])
@@ -600,7 +601,8 @@ int _tmain()
 
 	// Set the event g_hStreamStarted so that the other threads can start to transfer data
 	Sleep(g_StreamConfig.u32DelayStartTransfer);		// Only for debug
-	SetEvent(g_hStreamStarted);
+	SetEvent(g_hStreamStarted[0]);
+	SetEvent(g_hStreamStarted[1]);
 
 	pre_current_time = clock();
 	pre_time = ((double)(pre_current_time - pre_start_time)) / CLOCKS_PER_SEC * 1000;
@@ -617,7 +619,8 @@ int _tmain()
 			switch (toupper(_getch()))
 			{
 			case 27:			// ESC key -> abort
-				SetEvent(g_hStreamAbort);
+				SetEvent(g_hStreamAbort[0]);
+				SetEvent(g_hStreamAbort[1]);
 				bDone = TRUE;
 				break;
 			case 'F':			// F key -> force trigger
@@ -632,7 +635,8 @@ int _tmain()
 		// Quit if elapsed time greater than our setting. 
 		if (u32TickNow - u32TickStart >= g_StreamConfig.u32TimeCounter)
 		{
-			SetEvent(g_hStreamAbort);
+			SetEvent(g_hStreamAbort[0]);
+			SetEvent(g_hStreamAbort[1]);
 			bDone = TRUE;
 		}
 
@@ -656,10 +660,12 @@ int _tmain()
 	}
 
 	//	Abort the current acquisition 
-	CsDo(g_hSystem, ACTION_ABORT);
+	CsDo(g_hSystem[0], ACTION_ABORT);
+	CsDo(g_hSystem[1], ACTION_ABORT);
 
 	// Free the CompuScope system and any resources it's been using
-	i32Status = CsFreeSystem(g_hSystem);
+	i32Status = CsFreeSystem(g_hSystem[0]);
+	i32Status = CsFreeSystem(g_hSystem[1]);
 
 	if (g_GpuConfig.bUseGpu)
 	{
@@ -675,11 +681,11 @@ int _tmain()
 	}
 
 	// Check some events to see if there was any errors
-	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError, 0))
+	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[0], 0))
 	{
 		_ftprintf(stdout, _T("\nStream aborted on error.\n"));
 	}
-	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort, 0))
+	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0))
 	{
 		_ftprintf(stdout, _T("\nStream aborted by user.\n"));
 	}
@@ -1154,8 +1160,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 	BOOL				bDone = FALSE;
 	uInt32				u32LoopCount = 0;
-	uInt32				u32ErrorFlag = 0;
-	HANDLE				WaitEvents[2];
+	uInt32				u32ErrorFlag1 = 0;
+	uInt32				u32ErrorFlag2 = 0;
+	HANDLE				WaitEvents[4];
 	DWORD				dwWaitStatus;
 	DWORD				dwRetCode = 0;
 	DWORD				dwBytesSave = 0;
@@ -1262,6 +1269,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	{
 		_ftprintf(stderr, _T("\nUnable to allocate memory for stream buffer 11.\n"));
 		CloseHandle(hFile);
+		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[1]);
+
 		DeleteFile(szSaveFileName);
 		ExitThread(1);
 		ExitThread(2);
@@ -1272,6 +1282,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	{
 		_ftprintf(stderr, _T("\nUnable to allocate memory for stream buffer 12.\n"));
 		CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[1]);
+
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(1);
@@ -1284,6 +1297,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		_ftprintf(stderr, _T("\nUnable to allocate memory for stream buffer 21.\n"));
 		CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
 		CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[1]);
+
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(2);
@@ -1297,6 +1313,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
 		CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
 		CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[1]);
+
 		CloseHandle(hFile);
 		DeleteFile(szSaveFileName);
 		ExitThread(2);
@@ -1311,8 +1330,13 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostRegister failed! Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer11);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			return cudaStatus;
 		}
 		h_buffer12 = (unsigned char*)ALIGN_UP(pBuffer12, MEMORY_ALIGNMENT);
@@ -1320,8 +1344,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostRegister failed! Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer12);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			cudaHostUnregister(h_buffer11);
 			return cudaStatus;
 		}
@@ -1330,8 +1358,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostRegister failed! Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer21);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			return cudaStatus;
 		}
 		h_buffer22 = (unsigned char*)ALIGN_UP(pBuffer22, MEMORY_ALIGNMENT);
@@ -1339,8 +1371,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostRegister failed! Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer22);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			cudaHostUnregister(h_buffer21);
 			return cudaStatus;
 		}
@@ -1348,8 +1384,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostGetDevicePointer failed!  Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer11);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			cudaHostUnregister(h_buffer11);
 			cudaHostUnregister(h_buffer12);
 			return cudaStatus;
@@ -1358,18 +1398,29 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostGetDevicePointer failed!  Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer12);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			cudaHostUnregister(h_buffer11);
 			cudaHostUnregister(h_buffer12);
 			return cudaStatus;
 		}
+
+
+
 		cudaStatus = cudaHostGetDevicePointer((void**)&d_buffer21, (void*)h_buffer21, 0);
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostGetDevicePointer failed!  Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer21);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			cudaHostUnregister(h_buffer21);
 			cudaHostUnregister(h_buffer22);
 			return cudaStatus;
@@ -1378,8 +1429,12 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		if (cudaStatus != cudaSuccess)
 		{
 			fprintf(stderr, "cudaHostGetDevicePointer failed!  Error code %d\n", cudaStatus);
-			CsFreeSystem(g_hSystem);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer22);
+			CsFreeSystem(g_hSystem[0]);
+			CsFreeSystem(g_hSystem[1]);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			cudaHostUnregister(h_buffer21);
 			cudaHostUnregister(h_buffer22);
 			return cudaStatus;
@@ -1390,25 +1445,29 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 		// So far so good ...
 		// Let the main thread know that this thread is ready for stream
-		SetEvent(g_hThreadReadyForStream);
+		SetEvent(g_hThreadReadyForStream[0]);
+		SetEvent(g_hThreadReadyForStream[1]);
 
 
 		// Wait for the start acquisition event from the main thread
-		WaitEvents[0] = g_hStreamStarted;
-		WaitEvents[1] = g_hStreamAbort;
+		WaitEvents[0] = g_hStreamStarted[0];
+		WaitEvents[1] = g_hStreamStarted[1];
+		WaitEvents[2] = g_hStreamAbort[0];
+		WaitEvents[3] = g_hStreamAbort[1];
+
 
 
 	
 
-		dwWaitStatus = WaitForMultipleObjects(2, WaitEvents, FALSE, INFINITE);
+		dwWaitStatus = WaitForMultipleObjects(4, WaitEvents, FALSE, INFINITE);
 
 		if ((WAIT_OBJECT_0 + 1) == dwWaitStatus)
 		{
 			// Aborted from user or error
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer11);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer12);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer21);
-			CsStmFreeBuffer(g_hSystem, nCardIndex, pBuffer22);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
+			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer22);
 			CloseHandle(hFile);
 			if (g_GpuConfig.bUseGpu)
 			{
@@ -1614,8 +1673,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			if (timer == TRUE)
 				QueryPerformanceCounter(&transfer_start_time);  // mark the start time of data transfer and processing
 
-			i32Status = CsStmTransferToBuffer(g_hSystem[0], nCardIndex, pCurrentBuffer1, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
-			i32Status = CsStmTransferToBuffer(g_hSystem[1], nCardIndex, pCurrentBuffer2, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
+			i32Status = CsStmTransferToBuffer(g_hSystem[0], 1, pCurrentBuffer1, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
+			i32Status = CsStmTransferToBuffer(g_hSystem[1], 1, pCurrentBuffer2, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
 
 			if (CS_FAILED(i32Status))
 			{
@@ -1632,7 +1691,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 			// do processing here on dbuffer
 
-			if (NULL != d_buffer11|| NULL != d_buffer21)
+			if (NULL != d_buffer1|| NULL != d_buffer2)
 			{
 				if (g_GpuConfig.bUseGpu)
 				{
@@ -1643,8 +1702,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					if (correlation_type == 0) {
 						// perform cross correlation compute using GPU on the input data
 						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
-							(short*)d_buffer11,
-							(short*)d_buffer21,
+							(short*)d_buffer1,
+							(short*)d_buffer2,
 							u32TransferSizeSamples,
 							totalThreads,
 							gridSize,
@@ -1666,8 +1725,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 					else if (correlation_type == 1) {
 						// perform g2 correlation compute using GPU on the input data
 						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
-							(short*)d_buffer11,
-							(short*)d_buffer21,
+							(short*)d_buffer1,
+							(short*)d_buffer2,
 							u32TransferSizeSamples,
 							totalThreads,
 							gridSize,
@@ -1739,12 +1798,10 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 			// Wait for the DMA transfer on the current buffer to complete so we can loop back around to start a new one.
 			// The calling thread will sleep until the transfer completes
-			i32Status = CsStmGetTransferStatus(g_hSystem[0], 1, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength1, &u8EndOfData1);
-			CsGetErrorString(i32Status, msg, _countof(msg));   // or your DisplayErrorString(i32Status)
-			_tprintf(_T("CsStmGetTransferStatus 1 returned %s\n"), msg);
-			i32Status = CsStmGetTransferStatus(g_hSystem[1], 1, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag, &u32ActualLength2, &u8EndOfData2);
-			CsGetErrorString(i32Status, msg, _countof(msg));   // or your DisplayErrorString(i32Status)
-			_tprintf(_T("CsStmGetTransferStatus 2 returned %s\n"), msg);
+			i32Status = CsStmGetTransferStatus(g_hSystem[0], 1, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag1, &u32ActualLength1, &u8EndOfData1);
+
+			i32Status = CsStmGetTransferStatus(g_hSystem[1], 1, g_StreamConfig.u32TransferTimeout, &u32ErrorFlag2, &u32ActualLength2, &u8EndOfData2);
+
 
 			if (timer == TRUE) {
 				QueryPerformanceCounter(&transfer_end_time);  // Mark the end time of data transfer and processing
@@ -1759,9 +1816,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				g_llCardTotalData[nCardIndex - 1] += u32ActualLength1+ u32ActualLength2;//////////////////////////////////////////////////////////////////////////////////////////////////////////
 				bStreamCompletedSuccess = (0 != u8EndOfData1 && 0!= u8EndOfData2);
 
-				if (0 != u32ErrorFlag)
+				if (0 != u32ErrorFlag1 && 0 != u32ErrorFlag2)
 				{
-					if (STM_TRANSFER_ERROR_FIFOFULL & u32ErrorFlag)
+					if (STM_TRANSFER_ERROR_FIFOFULL & u32ErrorFlag1)
 					{
 						// The Fifo full error has occured at the card level which results data lost.
 						// This error occurs when the application is not fast enough to transfer data.
@@ -1769,7 +1826,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						{
 							// g_StreamConfig.bErrorHandling != 0
 							// Stop as soon as we recieve the FIFO full error from the card
-							SetEvent(g_hStreamError);
+							SetEvent(g_hStreamError[0]);
+							SetEvent(g_hStreamError[1]);
 							_ftprintf(stdout, _T("\nFifo full detected on the card %d !!!\n"), nCardIndex);
 							bDone = TRUE;
 						}
@@ -1786,10 +1844,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 							// Do nothing here, go backto the loop CsStmTransferToBuffer() CsStmGetTransferStatus()
 						}
 					}
-					if (u32ErrorFlag & STM_TRANSFER_ERROR_CHANNEL_PROTECTION)
+					if (u32ErrorFlag1 & STM_TRANSFER_ERROR_CHANNEL_PROTECTION)
 					{
 						// Channel protection error as coccrued
-						SetEvent(g_hStreamError);
+						SetEvent(g_hStreamError[0]);
+						SetEvent(g_hStreamError[1]);
 						_ftprintf(stdout, _T("\nChannel Protection Error on Board %d!!!\n"), nCardIndex);
 						bDone = TRUE;
 					}
@@ -1797,7 +1856,8 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			}
 			else
 			{
-				SetEvent(g_hStreamError);
+				SetEvent(g_hStreamError[0]);
+				SetEvent(g_hStreamError[1]);
 				bDone = TRUE;
 
 				if (CS_STM_TRANSFER_TIMEOUT == i32Status)
