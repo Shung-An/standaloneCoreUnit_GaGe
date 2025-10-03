@@ -1,0 +1,5 @@
+Experiment: Experiment_1
+One Step Time: 9.36 ms, Transfer and process Time: 9.36 ms, GPU Process Time: 0.00 ms
+One Step Time: 30894.00 ms, Transfer and process Time: 30893.99 ms, GPU Process Time: 30893.93 ms
+One Step Time: 65634.83 ms, Transfer and process Time: 65634.69 ms, GPU Process Time: 65634.63 ms
+2025-10-03  16: 9:54	  1	  1	  2	    1	    96067584		 2	 1	96538.186
