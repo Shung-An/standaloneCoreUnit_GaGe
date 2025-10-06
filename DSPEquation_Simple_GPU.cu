@@ -10,15 +10,6 @@
 
 
 
-#define CHECK_CUDA(call)                                                \
-    do {                                                                \
-        cudaError_t err = call;                                         \
-        if (err != cudaSuccess) {                                       \
-            fprintf(stderr, "CUDA error %s:%d: %s\n",                   \
-                    __FILE__, __LINE__, cudaGetErrorString(err));       \
-        }                                                               \
-    } while (0)
-
 
 void checkCuda(cudaError_t result, const char* msg) {
 	if (result != cudaSuccess) {
@@ -37,50 +28,72 @@ void checkCublas(cublasStatus_t result, const char* msg) {
 
 
 
-// Demodulation at 8 correlation matrix with shared memory, light version
-__global__ void demodulationCrossCorrelation(short* data, 
-												short* dataB,	
-												__int64 numElements, 
-												double* aggregatedCorrMatrix, 
-												const int sharedSegmentSize, 
-												const int totalThreads,
-												const int demodulationWindowSize, 
-												const int corrMatrixSize, 
-												const int segmentSize) 
+__global__ void demodulationCrossCorrelation(
+	const short* __restrict__ dataA,
+	const short* __restrict__ dataB,
+	long long numElements,               // total samples across BOTH channels OR per-channel (see flag)
+	double* __restrict__ aggregatedCorrMatrix,
+	int sharedSegmentSize,               // count of doubles (>= 4*W); optional
+	int totalThreads,                    // W*W (unused if we stride)
+	int W,                               // demodulationWindowSize
+	int corrMatrixSize,                  // should be W*W
+	int segmentSize                     // expected 2*W per channel
+)
 {
-	
-	int index = blockDim.x * blockIdx.x + threadIdx.x;
-	int indexShareMemory = threadIdx.x/2;
-	// Declare shared memory
-	//__shared__ float sharedSegment[sharedSegmentSize]; 
-	extern __shared__ double sharedSegment[];
-	// load data into shared memory
-	if (threadIdx.x < sharedSegmentSize && threadIdx.x%2==0) {
-		sharedSegment[threadIdx.x] = static_cast<double>(data[blockIdx.x * sharedSegmentSize + indexShareMemory]);
+	const int seg = blockIdx.x;                       // one block per segment
+	const long long perChan = 1 ? (numElements >> 1) : numElements;
+	const long long base = 1LL * seg * segmentSize;
+
+	// Hard guards
+	if (segmentSize != 2 * W) return;
+	if (base + segmentSize > perChan) return;
+	if (corrMatrixSize != W * W) return;
+
+	extern __shared__ double sh[]; // length >= 4*W doubles
+
+	// Zero shared (optional but helps catch mistakes)
+	for (int i = threadIdx.x; i < 4 * W; i += blockDim.x) sh[i] = 0.0;
+	__syncthreads();
+
+	// Load: Row0 = [A0,B0] interleaved, Row1 = [A1,B1] interleaved
+	// We fill all 4*W slots with a single strided loop.
+	for (int t = threadIdx.x; t < 4 * W; t += blockDim.x) {
+		const int row = (t >= 2 * W);                 // 0 for row0, 1 for row1
+		const int j = t - (row ? 2 * W : 0);        // 0..2W-1 within the row
+		const int p = j >> 1;                       // 0..W-1 sample index
+		const bool isB = j & 1;                       // even=A, odd=B
+		const long long off = base + row * W + p;     // per-channel offset
+
+		short v = isB ? dataB[off] : dataA[off];
+		sh[t] = (double)v;
 	}
-	if (threadIdx.x < sharedSegmentSize && threadIdx.x % 2 == 1)	{
-		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + indexShareMemory]);
+	__syncthreads();
+
+	// Optional: small sanity print
+	if (blockIdx.x == 0 && threadIdx.x == 0) {
+		printf("seg=%d base=%lld W=%d segSize=%d corrSize=%d sh[0]=%.0f sh[1]=%.0f sh[2W]=%.0f sh[2W+1]=%.0f\n",
+			seg, (long long)base, W, segmentSize, corrMatrixSize,
+			sh[0], sh[1], sh[2 * W], sh[2 * W + 1]);
 	}
 
+	// Correlation computation over W*W, strided
+	for (int tt = threadIdx.x; tt < corrMatrixSize; tt += blockDim.x) {
+		const int row = tt / W;    // 0..W-1
+		const int col = tt % W;    // 0..W-1
 
-	__syncthreads(); // Ensure all threads have loaded their data into shared memory
+		// Access helpers (AB interleaved)
+		const double a0 = sh[2 * row + 0];            // A0[row]
+		const double a1 = sh[2 * W + 2 * row + 0];    // A1[row]
+		const double b0 = sh[2 * col + 1];            // B0[col]
+		const double b1 = sh[2 * W + 2 * col + 1];    // B1[col]
 
-	if (index < totalThreads) {
-		int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
-		int col = threadIdx.x % demodulationWindowSize;
+		const double corr = (a0 - a1) * (b0 - b1);
 
-		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
-
-		double value1 = sharedSegment[segmentStart + row * 2];
-		double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) * 2];
-		double value3 = sharedSegment[segmentStart + col * 2 + 1];
-		double value4 = sharedSegment[segmentStart + (col + demodulationWindowSize) * 2 + 1];
-
-		double corrValue = (value1 - value2) * (value3 - value4);
-
-		aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
+		const long long outBase = 1LL * seg * corrMatrixSize;
+		aggregatedCorrMatrix[outBase + row * W + col] = corr;
 	}
 }
+
 
 
 
@@ -215,6 +228,9 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	const double alpha = 1.0;
 	const double beta = 0.0;
 
+	// Wait for the GPU to finish
+	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
+
 	// d_aggregatedCorrMatrix is a corrMatrixSize x totalSegNum matrix
 	// d_scaling_factors is a totalSegNum x 1 vector
 	// d_averageMatrix is a corrMatrixSize x 1 vector
@@ -233,20 +249,6 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	// Wait for the GPU to finish
 	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
 	 
-	size_t bytes = size * sizeof(int);        // or whatever type
-	short* h = (short*)malloc(bytes);       // host buffer
-
-	// copy device -> host (blocking)
-	cudaError_t err = cudaMemcpy(h, data, bytes, cudaMemcpyDeviceToHost);
-	if (err != cudaSuccess) {
-		fprintf(stderr, "cudaMemcpy D2H failed: %s\n", cudaGetErrorString(err));
-	}
-
-
-	for (int i = 0; i < 100; i++) {
-		printf("\n%d\t%d\t%d", i, h[i], (unsigned short)h[i]);
-	}
-
 
 	// Write results to Analysis file
 	if (AnalysisFile) {
