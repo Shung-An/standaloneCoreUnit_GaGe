@@ -35,7 +35,7 @@ __global__ void demodulationCrossCorrelation(
 	double*  aggregatedCorrMatrix,
 	int sharedSegmentSize,               // count of doubles (>= 4*W); optional
 	int totalThreads,                    // W*W (unused if we stride)
-	int W,                               // demodulationWindowSize
+	int demodulationWindowSize,                               // demodulationWindowSize
 	int corrMatrixSize,                  // should be W*W
 	int segmentSize                     // expected 2*W per channel
 )
@@ -43,7 +43,7 @@ __global__ void demodulationCrossCorrelation(
 	extern __shared__ double sharedSegment[];
 	
 
-	const int t = threadIdx.x;
+	int t = blockDim.x * blockIdx.x + threadIdx.x;
 	const int half = sharedSegmentSize / 2;                 // = 2*W
 
 	if (threadIdx.x < half) {
@@ -53,20 +53,20 @@ __global__ void demodulationCrossCorrelation(
 		if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
 
 		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-		//printf("t=%d shmemB=%f\n", t, sharedSegment[threadIdx.x]);
+		//printf("t=%d\t%d\n", t, blockIdx.x * sharedSegmentSize + threadIdx.x);
 	}
 
 	__syncthreads();
 
-	if (t < totalThreads) {
-		int row = t % corrMatrixSize / W;
-		int col = t % W;
+	if ( t < totalThreads) {
+		int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
+		int col = threadIdx.x % demodulationWindowSize;
 
-		int segmentStart = t / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
+		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
 
 		double value1 = sharedSegment[segmentStart + row ];
-		double value2 = sharedSegment[segmentStart + (row + W) ];
-		double value3 = sharedSegment[half + row];
+		double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) ];
+		//double value3 = sharedSegment[half + row];
 
 
 
@@ -75,7 +75,7 @@ __global__ void demodulationCrossCorrelation(
 
 	//	aggregatedCorrMatrix[t] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
 
-		//printf("\n%d\t%d\t%f", t, segmentStart + row+half, value3);
+		//printf("\n%d\t%d\t%d", t, segmentStart, totalThreads);
 	}	
 	
 }
