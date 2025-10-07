@@ -46,19 +46,15 @@ __global__ void demodulationCrossCorrelation(
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	const int half = sharedSegmentSize / 2;                 // = 2*W
 
-	if (threadIdx.x < sharedSegmentSize) {
+
+	if (threadIdx.x < half) {
 		sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		printf("t=%d\t%d shmemA=%f\n", index, blockIdx.x * sharedSegmentSize + threadIdx.x, sharedSegment[threadIdx.x]);
 	}
-
-	//if (threadIdx.x < half) {
-	//	sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-	//	//printf("t=%d shmemA=%f\n", t, sharedSegment[threadIdx.x]);
-	//}
-	//	if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
-
-	//	sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-	//	//printf("t=%d\t%d\n", t, blockIdx.x * sharedSegmentSize + threadIdx.x);
-	//}
+		if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
+		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		//printf("t=%d\t%d\n", t, blockIdx.x * sharedSegmentSize + threadIdx.x);
+	}
 
 	__syncthreads();
 

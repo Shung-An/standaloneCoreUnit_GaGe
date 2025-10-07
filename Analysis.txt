@@ -1,6 +1,6 @@
 //////
 Buffer size (Samples)
-3912
+1960
 Sampling Rate (Hz)
 1000000000
 ///
