@@ -1,4 +1,4 @@
-
+﻿
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <stdio.h>
@@ -29,10 +29,10 @@ void checkCublas(cublasStatus_t result, const char* msg) {
 
 
 __global__ void demodulationCrossCorrelation(
-	const short* __restrict__ dataA,
-	const short* __restrict__ dataB,
+	const short*  dataA,
+	const short*  dataB,
 	long long numElements,               // total samples across BOTH channels OR per-channel (see flag)
-	double* __restrict__ aggregatedCorrMatrix,
+	double*  aggregatedCorrMatrix,
 	int sharedSegmentSize,               // count of doubles (>= 4*W); optional
 	int totalThreads,                    // W*W (unused if we stride)
 	int W,                               // demodulationWindowSize
@@ -40,58 +40,44 @@ __global__ void demodulationCrossCorrelation(
 	int segmentSize                     // expected 2*W per channel
 )
 {
-	const int seg = blockIdx.x;                       // one block per segment
-	const long long perChan = 1 ? (numElements >> 1) : numElements;
-	const long long base = 1LL * seg * segmentSize;
+	extern __shared__ double sharedSegment[];
+	
 
-	// Hard guards
-	if (segmentSize != 2 * W) return;
-	if (base + segmentSize > perChan) return;
-	if (corrMatrixSize != W * W) return;
+	const int t = threadIdx.x;
+	const int half = sharedSegmentSize / 2;                 // = 2*W
 
-	extern __shared__ double sh[]; // length >= 4*W doubles
+	if (threadIdx.x < half) {
+		sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		//printf("t=%d shmemA=%f\n", t, sharedSegment[threadIdx.x]);
+	}
+		if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
 
-	// Zero shared (optional but helps catch mistakes)
-	for (int i = threadIdx.x; i < 4 * W; i += blockDim.x) sh[i] = 0.0;
+		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		//printf("t=%d shmemB=%f\n", t, sharedSegment[threadIdx.x]);
+	}
+
 	__syncthreads();
 
-	// Load: Row0 = [A0,B0] interleaved, Row1 = [A1,B1] interleaved
-	// We fill all 4*W slots with a single strided loop.
-	for (int t = threadIdx.x; t < 4 * W; t += blockDim.x) {
-		const int row = (t >= 2 * W);                 // 0 for row0, 1 for row1
-		const int j = t - (row ? 2 * W : 0);        // 0..2W-1 within the row
-		const int p = j >> 1;                       // 0..W-1 sample index
-		const bool isB = j & 1;                       // even=A, odd=B
-		const long long off = base + row * W + p;     // per-channel offset
+	if (t < totalThreads) {
+		int row = t % corrMatrixSize / W;
+		int col = t % W;
 
-		short v = isB ? dataB[off] : dataA[off];
-		sh[t] = (double)v;
-	}
-	__syncthreads();
+		int segmentStart = t / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
 
-	// Optional: small sanity print
-	if (blockIdx.x == 0 && threadIdx.x == 0) {
-		printf("seg=%d base=%lld W=%d segSize=%d corrSize=%d sh[0]=%.0f sh[1]=%.0f sh[2W]=%.0f sh[2W+1]=%.0f\n",
-			seg, (long long)base, W, segmentSize, corrMatrixSize,
-			sh[0], sh[1], sh[2 * W], sh[2 * W + 1]);
-	}
+		double value1 = sharedSegment[segmentStart + row ];
+		double value2 = sharedSegment[segmentStart + (row + W) ];
+		double value3 = sharedSegment[half + row];
 
-	// Correlation computation over W*W, strided
-	for (int tt = threadIdx.x; tt < corrMatrixSize; tt += blockDim.x) {
-		const int row = tt / W;    // 0..W-1
-		const int col = tt % W;    // 0..W-1
 
-		// Access helpers (AB interleaved)
-		const double a0 = sh[2 * row + 0];            // A0[row]
-		const double a1 = sh[2 * W + 2 * row + 0];    // A1[row]
-		const double b0 = sh[2 * col + 1];            // B0[col]
-		const double b1 = sh[2 * W + 2 * col + 1];    // B1[col]
 
-		const double corr = (a0 - a1) * (b0 - b1);
+		// Store the correlation matrix in column-major order
+		double corrValue = (value1 - value2);
 
-		const long long outBase = 1LL * seg * corrMatrixSize;
-		aggregatedCorrMatrix[outBase + row * W + col] = corr;
-	}
+	//	aggregatedCorrMatrix[t] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
+
+		//printf("\n%d\t%d\t%f", t, segmentStart + row+half, value3);
+	}	
+	
 }
 
 
@@ -193,6 +179,77 @@ __global__ void divideG2Matrix(double* g2Matrix, double* d_reducedCorrMatrixA, d
     }
 }
 
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t _e = (call);                                             \
+        if (_e != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA error %s:%d: %s\n",                        \
+                    __FILE__, __LINE__, cudaGetErrorString(_e));             \
+            exit(1);                                                         \
+        }                                                                    \
+    } while (0)
+
+void fetch_and_save_corr(const double* d_aggregatedCorrMatrix,
+	int W,                 /* window size */
+	int numSegments,       /* gridDim.x (one block per segment) */
+	const char* csv_path)  /* e.g., "corr_dump.csv" */
+{
+	size_t perSeg = (size_t)W * (size_t)W;                 /* W*W */
+	size_t total = perSeg * (size_t)numSegments;
+
+	double* h = (double*)malloc(total * sizeof(double));
+	if (!h) {
+		fprintf(stderr, "malloc failed for %zu doubles\n", total);
+		exit(1);
+	}
+
+	/* surface async errors, ensure kernel is done */
+	CUDA_CHECK(cudaDeviceSynchronize());
+	CUDA_CHECK(cudaGetLastError());
+
+	/* D→H copy */
+	CUDA_CHECK(cudaMemcpy(h,
+		d_aggregatedCorrMatrix,
+		total * sizeof(double),
+		cudaMemcpyDeviceToHost));
+
+	/* quick peek: first 8 values of segment 0 */
+	{
+		int i, n = (int)((perSeg < 8) ? perSeg : 8);
+		printf("Segment 0, first %d values:", n);
+		for (i = 0; i < n; ++i) printf(" %.6g", h[i]);
+		printf("\n");
+	}
+
+	/* write CSV (row-major), blank line between segments */
+	if (csv_path && csv_path[0]) {
+		FILE* fp = fopen(csv_path, "w");
+		if (!fp) {
+			fprintf(stderr, "Failed to open %s for writing\n", csv_path);
+		}
+		else {
+			int seg, r, c;
+			for (seg = 0; seg < numSegments; ++seg) {
+				fprintf(fp, "# segment %d\n", seg);
+				size_t base = (size_t)seg * perSeg;
+				for (r = 0; r < W; ++r) {
+					for (c = 0; c < W; ++c) {
+						if (c) fputc(',', fp);
+						/* layout: base + r*W + c */
+						fprintf(fp, "%.17g", h[base + (size_t)r * (size_t)W + (size_t)c]);
+					}
+					fputc('\n', fp);
+				}
+				fputc('\n', fp);
+			}
+			fclose(fp);
+			printf("Wrote %s\n", csv_path);
+		}
+	}
+
+	free(h);
+}
+
 
 // Helper function for using CUDA to compute cross correlation.
 extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			// Loop count
@@ -220,6 +277,13 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
 	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
+	
+	/* after launching demodulationCrossCorrelation<<<grid, block, shmem_bytes>>>(...); */
+
+	//fetch_and_save_corr(d_aggregatedCorrMatrix,
+	//	demodulationWindowSize,                /* demodulationWindowSize */
+	//	corrMatrixSize,      /* gridDim.x used for launch */
+	//	"corr_dump.csv"); /* output path */
 
 
 	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
@@ -298,6 +362,8 @@ extern "C" cudaError_t ComputeG2CorrelationGPU(const __int64 u32LoopCount,      
 	// Compute correlation matrices A and B using shared memory
 	demodulationAutoCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_correlationMatrixA, d_correlationMatrixB, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
 	
+
+
 	// Perform matrix-vector multiplication using cuBLAS for reducing the aggregated correlation matrix A
 	// 64 x N matrix-vector multiplication
 	int Nrows = corrMatrixSize;
