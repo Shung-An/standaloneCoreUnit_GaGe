@@ -43,7 +43,7 @@ __global__ void demodulationCrossCorrelation(
 	extern __shared__ double sharedSegment[];
 	
 
-	int t = blockDim.x * blockIdx.x + threadIdx.x;
+	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	const int half = sharedSegmentSize / 2;                 // = 2*W
 
 	if (threadIdx.x < half) {
@@ -58,24 +58,25 @@ __global__ void demodulationCrossCorrelation(
 
 	__syncthreads();
 
-	if ( t < totalThreads) {
+	if ( index < totalThreads) {
 		int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
 		int col = threadIdx.x % demodulationWindowSize;
 
-		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
+		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize/2; // Determine the starting index of the segment in shared memory
 
 		double value1 = sharedSegment[segmentStart + row ];
 		double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) ];
-		//double value3 = sharedSegment[half + row];
+		double value3 = sharedSegment[segmentStart + half + col];
+		double value4 = sharedSegment[segmentStart + half + (col+demodulationWindowSize)];
 
 
 
 		// Store the correlation matrix in column-major order
-		double corrValue = (value1 - value2);
+		double corrValue = (value1 - value2)* (value3 - value4);
 
-	//	aggregatedCorrMatrix[t] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
+		aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
 
-		//printf("\n%d\t%d\t%d", t, segmentStart, totalThreads);
+		//printf("\n%d\t%d\t%d", index, segmentStart + row, segmentStart + half + col);
 	}	
 	
 }
