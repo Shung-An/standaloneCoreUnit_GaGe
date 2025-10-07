@@ -29,15 +29,15 @@ void checkCublas(cublasStatus_t result, const char* msg) {
 
 
 __global__ void demodulationCrossCorrelation(
-	const short*  dataA,
-	const short*  dataB,
-	long long numElements,               // total samples across BOTH channels OR per-channel (see flag)
+	 short*  dataA,
+	 short*  dataB,
+	__int64 numElements,               // total samples across BOTH channels OR per-channel (see flag)
 	double*  aggregatedCorrMatrix,
-	int sharedSegmentSize,               // count of doubles (>= 4*W); optional
-	int totalThreads,                    // W*W (unused if we stride)
-	int demodulationWindowSize,                               // demodulationWindowSize
-	int corrMatrixSize,                  // should be W*W
-	int segmentSize                     // expected 2*W per channel
+	const int sharedSegmentSize,               // count of doubles (>= 4*W); optional
+	const int totalThreads,                    // W*W (unused if we stride)
+	const int demodulationWindowSize,                               // demodulationWindowSize
+	const int corrMatrixSize,                  // should be W*W
+	const int segmentSize                     // expected 2*W per channel
 )
 {
 	extern __shared__ double sharedSegment[];
@@ -46,38 +46,42 @@ __global__ void demodulationCrossCorrelation(
 	int index = blockDim.x * blockIdx.x + threadIdx.x;
 	const int half = sharedSegmentSize / 2;                 // = 2*W
 
-	if (threadIdx.x < half) {
+	if (threadIdx.x < sharedSegmentSize) {
 		sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-		//printf("t=%d shmemA=%f\n", t, sharedSegment[threadIdx.x]);
 	}
-		if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
 
-		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-		//printf("t=%d\t%d\n", t, blockIdx.x * sharedSegmentSize + threadIdx.x);
-	}
+	//if (threadIdx.x < half) {
+	//	sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+	//	//printf("t=%d shmemA=%f\n", t, sharedSegment[threadIdx.x]);
+	//}
+	//	if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
+
+	//	sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+	//	//printf("t=%d\t%d\n", t, blockIdx.x * sharedSegmentSize + threadIdx.x);
+	//}
 
 	__syncthreads();
 
-	if ( index < totalThreads) {
-		int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
-		int col = threadIdx.x % demodulationWindowSize;
+	//if ( index < totalThreads) {
+	//	int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
+	//	int col = threadIdx.x % demodulationWindowSize;
 
-		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize/2; // Determine the starting index of the segment in shared memory
+	//	int segmentStart = threadIdx.x / corrMatrixSize * segmentSize/2; // Determine the starting index of the segment in shared memory
 
-		double value1 = sharedSegment[segmentStart + row ];
-		double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) ];
-		double value3 = sharedSegment[segmentStart + half + col];
-		double value4 = sharedSegment[segmentStart + half + (col+demodulationWindowSize)];
+	//	double value1 = sharedSegment[segmentStart + row ];
+	//	double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) ];
+	//	double value3 = sharedSegment[segmentStart + half + col];
+	//	double value4 = sharedSegment[segmentStart + half + (col+demodulationWindowSize)];
 
 
 
-		// Store the correlation matrix in column-major order
-		double corrValue = (value1 - value2)* (value3 - value4);
+	//	// Store the correlation matrix in column-major order
+	//	double corrValue = (value1 - value2)* (value3 - value4);
 
-		aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
+	//	aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
 
-		//printf("\n%d\t%d\t%d", index, segmentStart + row, segmentStart + half + col);
-	}	
+	//	//printf("\n%d\t%d\t%d", index, segmentStart + row, segmentStart + half + col);
+	//}	
 	
 }
 
