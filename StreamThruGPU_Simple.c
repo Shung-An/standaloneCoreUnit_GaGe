@@ -656,7 +656,7 @@ int _tmain()
 			llSystemTotalData += g_llCardTotalData[i];
 		}
 
-		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize, NULL);
+		//UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize, NULL);
 	}
 
 	//	Abort the current acquisition 
@@ -1483,12 +1483,15 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		}
 
 		// Convert the transfer size to BYTEs or WORDs depending on the card.
-		u32TransferSizeSamples = g_StreamConfig.u32BufferSizeBytes / g_CsSysInfo.u32SampleSize;
+		u32TransferSizeSamples = g_StreamConfig.u32BufferSizeBytes / g_CsSysInfo.u32SampleSize ;
+		int u32TransferSizeSamples1 = 0;
 
-		segmentSize = demodulationWindowSize * 4;												// Size of one segment in the input data
+		u32TransferSizeSamples1 = u32TransferSizeSamples*2;
+
+		segmentSize = demodulationWindowSize * 2;												// Size of one segment in the input data
 		corrMatrixSize = demodulationWindowSize * demodulationWindowSize;				// Size of the correlation matrix 
-		totalSegNum = u32TransferSizeSamples / segmentSize;										// Total number of segments in the data transfer
-		totalThreads = u32TransferSizeSamples * demodulationWindowSize / 4;					// Total number of threads lanuched in the kernel
+		totalSegNum = u32TransferSizeSamples1 / segmentSize/2;										// Total number of segments in the data transfer
+		totalThreads = u32TransferSizeSamples1 * demodulationWindowSize / 4;					// Total number of threads lanuched in the kernel
 		sharedSegmentSize = blockSize * 4 / demodulationWindowSize;							// Size of the shared memory segment of one block
 		gridSize = (totalThreads + blockSize - 1) / blockSize;								// Number of blocks in the grid
 
@@ -1704,13 +1707,13 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
 							(short*)d_buffer1,
 							(short*)d_buffer2,
-							u32TransferSizeSamples*2,
-							totalThreads*2,
-							gridSize*2,
+							u32TransferSizeSamples1,
+							totalThreads,
+							gridSize,
 							blockSize,
 							sharedSegmentSize,
 							demodulationWindowSize,
-							totalSegNum*2,
+							totalSegNum,
 							corrMatrixSize,
 							segmentSize,
 							h_odata,
@@ -1727,9 +1730,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
 							(short*)d_buffer1,
 							(short*)d_buffer2,
-							u32TransferSizeSamples*2,
-							totalThreads*2,
-							gridSize*2,
+							u32TransferSizeSamples1,
+							totalThreads,
+							gridSize,
 							blockSize,
 							sharedSegmentSize,
 							demodulationWindowSize,

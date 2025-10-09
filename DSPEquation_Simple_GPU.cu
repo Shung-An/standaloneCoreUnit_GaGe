@@ -35,57 +35,62 @@ __global__ void demodulationCrossCorrelation(
 	double*  aggregatedCorrMatrix,
 	const int sharedSegmentSize,               // count of doubles (>= 4*W); optional
 	const int totalThreads,                    // W*W (unused if we stride)
-	const int demodulationWindowSize,                               // demodulationWindowSize
+	const int W,                               // demodulationWindowSize
 	const int corrMatrixSize,                  // should be W*W
 	const int segmentSize                     // expected 2*W per channel
 )
 {
-	extern __shared__ double sharedSegment[];
-	
-
-	int index = blockDim.x * blockIdx.x + threadIdx.x;
-	const int half = sharedSegmentSize / 2;                 // = 2*W
 
 
-	if (threadIdx.x < half) {
-		sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-		printf("t=%d\t%d shmemA=%f\n", index, blockIdx.x * sharedSegmentSize + threadIdx.x, sharedSegment[threadIdx.x]);
+	// ---- static sanity (once) ----
+	if (segmentSize != 2 * W || corrMatrixSize != W * W) return;
+
+	// Per-channel length; we assume the two channels are the same length
+	const long long perChan = numElements >> 1;  // (numElements / 2)
+
+	// How many full segments per channel (CEIL)
+	const int totalSegNum = (int)((perChan + segmentSize - 1) / segmentSize);
+
+	const int tid = threadIdx.x;
+	const int tpb = blockDim.x;
+	const int gdim = gridDim.x;
+
+	// ---- grid-stride over segments ----
+	for (int s = blockIdx.x; s < totalSegNum; s += gdim) {
+		const long long base = 1LL * s * segmentSize;
+
+		// If the whole segment is beyond perChan, skip safely.
+		if (base >= perChan) continue;
+
+		// ---- block-stride over the W*W inner work ----
+		for (int k = tid; k < W * W; k += tpb) {
+			const int row = k / W;   // 0..W-1
+			const int col = k % W;   // 0..W-1
+
+			// Global indices we will read
+			const long long iA0 = base + row;
+			const long long iA1 = base + W + row;
+			const long long iB0 = base + col;
+			const long long iB1 = base + W + col;
+
+			// Tail guards (last segment may be partial)
+			if (iA0 >= perChan || iA1 >= perChan || iB0 >= perChan || iB1 >= perChan)
+				continue;
+
+			// Loads
+			const double a0 = (double)dataA[iA0];
+			const double a1 = (double)dataA[iA1];
+			const double b0 = (double)dataB[iB0];
+			const double b1 = (double)dataB[iB1];
+
+			const double corr = (a0 - a1) * (b0 - b1);
+
+			// Write result for this segment into its W×W tile (row-major)
+			const long long outBase = 1LL * s * corrMatrixSize;
+			aggregatedCorrMatrix[outBase + row * W + col] = corr;
+		}
 	}
-		if (threadIdx.x>=half && threadIdx.x < sharedSegmentSize){
-		sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
-		//printf("t=%d\t%d\n", t, blockIdx.x * sharedSegmentSize + threadIdx.x);
-	}
-
-	__syncthreads();
-
-	//if ( index < totalThreads) {
-	//	int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
-	//	int col = threadIdx.x % demodulationWindowSize;
-
-	//	int segmentStart = threadIdx.x / corrMatrixSize * segmentSize/2; // Determine the starting index of the segment in shared memory
-
-	//	double value1 = sharedSegment[segmentStart + row ];
-	//	double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) ];
-	//	double value3 = sharedSegment[segmentStart + half + col];
-	//	double value4 = sharedSegment[segmentStart + half + (col+demodulationWindowSize)];
-
-
-
-	//	// Store the correlation matrix in column-major order
-	//	double corrValue = (value1 - value2)* (value3 - value4);
-
-	//	aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
-
-	//	//printf("\n%d\t%d\t%d", index, segmentStart + row, segmentStart + half + col);
-	//}	
-	
 }
-
-
-
-
-
-
 
 __global__ void demodulationAutoCorrelation(short* data,
 	short* dataB,
@@ -140,11 +145,6 @@ __global__ void demodulationAutoCorrelation(short* data,
 }
 
 
-
-
-
-
-
 // CUDA kernel to initialize the array
 __global__ void initializeArrayKernel(double* array, int size, double value) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -190,66 +190,6 @@ __global__ void divideG2Matrix(double* g2Matrix, double* d_reducedCorrMatrixA, d
         }                                                                    \
     } while (0)
 
-void fetch_and_save_corr(const double* d_aggregatedCorrMatrix,
-	int W,                 /* window size */
-	int numSegments,       /* gridDim.x (one block per segment) */
-	const char* csv_path)  /* e.g., "corr_dump.csv" */
-{
-	size_t perSeg = (size_t)W * (size_t)W;                 /* W*W */
-	size_t total = perSeg * (size_t)numSegments;
-
-	double* h = (double*)malloc(total * sizeof(double));
-	if (!h) {
-		fprintf(stderr, "malloc failed for %zu doubles\n", total);
-		exit(1);
-	}
-
-	/* surface async errors, ensure kernel is done */
-	CUDA_CHECK(cudaDeviceSynchronize());
-	CUDA_CHECK(cudaGetLastError());
-
-	/* D→H copy */
-	CUDA_CHECK(cudaMemcpy(h,
-		d_aggregatedCorrMatrix,
-		total * sizeof(double),
-		cudaMemcpyDeviceToHost));
-
-	/* quick peek: first 8 values of segment 0 */
-	{
-		int i, n = (int)((perSeg < 8) ? perSeg : 8);
-		printf("Segment 0, first %d values:", n);
-		for (i = 0; i < n; ++i) printf(" %.6g", h[i]);
-		printf("\n");
-	}
-
-	/* write CSV (row-major), blank line between segments */
-	if (csv_path && csv_path[0]) {
-		FILE* fp = fopen(csv_path, "w");
-		if (!fp) {
-			fprintf(stderr, "Failed to open %s for writing\n", csv_path);
-		}
-		else {
-			int seg, r, c;
-			for (seg = 0; seg < numSegments; ++seg) {
-				fprintf(fp, "# segment %d\n", seg);
-				size_t base = (size_t)seg * perSeg;
-				for (r = 0; r < W; ++r) {
-					for (c = 0; c < W; ++c) {
-						if (c) fputc(',', fp);
-						/* layout: base + r*W + c */
-						fprintf(fp, "%.17g", h[base + (size_t)r * (size_t)W + (size_t)c]);
-					}
-					fputc('\n', fp);
-				}
-				fputc('\n', fp);
-			}
-			fclose(fp);
-			printf("Wrote %s\n", csv_path);
-		}
-	}
-
-	free(h);
-}
 
 
 // Helper function for using CUDA to compute cross correlation.
@@ -274,17 +214,18 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	FILE * AnalysisFile)																// Analysis file showing the reduced correlation matrix
 {
 	cudaError_t cudaStatus = cudaSuccess; // Return status of CUDA functions
+	short* h_dataA;		// Host input data from the GPU
+	short* h_dataB;
+	double* h_dataAB;	// Host output data from the GPU
+	double* h_aggregatedCorrMatrix;
 
+	h_dataA = (short*)malloc(size / 2 * sizeof(short));		// Output data from the GPU
+	h_dataB = (short*)malloc(size / 2 * sizeof(short));
+	h_dataAB = (double*)malloc(corrMatrixSize * sizeof(double));
+	h_aggregatedCorrMatrix = (double*)malloc(size*2 * sizeof(double)); // Aggregated correlation matrix from GPU
 
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
 	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
-	
-	/* after launching demodulationCrossCorrelation<<<grid, block, shmem_bytes>>>(...); */
-
-	//fetch_and_save_corr(d_aggregatedCorrMatrix,
-	//	demodulationWindowSize,                /* demodulationWindowSize */
-	//	corrMatrixSize,      /* gridDim.x used for launch */
-	//	"corr_dump.csv"); /* output path */
 
 
 	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
@@ -311,9 +252,44 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	// Copy the result from device back to the host
 	checkCuda(cudaMemcpy(h_odata, d_reducedCorrMatrix, corrMatrixSize * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
 
+
+	checkCuda(cudaMemcpy(h_dataA, data, size / 2 * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	checkCuda(cudaMemcpy(h_dataB, dataB, size / 2 * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	checkCuda(cudaMemcpy(h_aggregatedCorrMatrix, d_aggregatedCorrMatrix,size*2 * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+
+
+	const int W = 8;
+	const int segmentSizeH = 2 * W;                 // 16 per channel
+	const int perChan = (int)(size / 2);           // 'size' is total across A+B
+	const int numSegments = perChan / segmentSizeH; // safer than size/32
+	const int corrSize = W * W;
+
+	// zero the accumulator
+	for (int i = 0; i < corrSize; ++i) h_dataAB[i] = 0.0;
+
+	for (int seg = 0; seg < numSegments; ++seg) {
+		const int base = seg * segmentSizeH; // per-channel base
+
+		for (int j = 0; j < W; ++j) {
+			const double da = (double)h_dataA[base + j] - (double)h_dataA[base + W + j]; // A0-A1
+			for (int k = 0; k < W; ++k) {
+				const double db = (double)h_dataB[base + k] - (double)h_dataB[base + W + k]; // B0-B1
+				const int idx = j * W + k;   // row-major to match GPU write
+				h_dataAB[idx] += da * db;    // accumulate across segments
+				//printf("%d\t%f\t%f\t%f\t%f\n",idx+ seg*64,da ,db, da * db, h_aggregatedCorrMatrix[idx + seg * 64]);
+			}
+		}
+	}
+
+	for (int i = 0; i < corrMatrixSize; ++i) {
+		h_dataAB[i] /= (double)size / 32;
+		if (h_dataAB[i]!= h_odata[i])	printf("CPU: %d\t%.10f\tGPU: %.10f\n", i, h_dataAB[i], h_odata[i]);
+	}
+
 	// Wait for the GPU to finish
 	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
-	 
+	
+
 
 	// Write results to Analysis file
 	if (AnalysisFile) {
