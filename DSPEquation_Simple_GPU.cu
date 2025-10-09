@@ -214,18 +214,21 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	FILE * AnalysisFile)																// Analysis file showing the reduced correlation matrix
 {
 	cudaError_t cudaStatus = cudaSuccess; // Return status of CUDA functions
-	short* h_dataA;		// Host input data from the GPU
-	short* h_dataB;
-	double* h_dataAB;	// Host output data from the GPU
-	double* h_aggregatedCorrMatrix;
 
-	h_dataA = (short*)malloc(size / 2 * sizeof(short));		// Output data from the GPU
-	h_dataB = (short*)malloc(size / 2 * sizeof(short));
-	h_dataAB = (double*)malloc(corrMatrixSize * sizeof(double));
-	h_aggregatedCorrMatrix = (double*)malloc(size*2 * sizeof(double)); // Aggregated correlation matrix from GPU
+
+
+	//short* h_dataA;		// Host input data from the GPU
+	//short* h_dataB;
+	//double* h_dataAB;	// Host output data from the GPU
+	//double* h_aggregatedCorrMatrix;
+	//h_dataA = (short*)malloc(size / 2 * sizeof(short));		// Output data from the GPU
+	//h_dataB = (short*)malloc(size / 2 * sizeof(short));
+	//h_dataAB = (double*)malloc(corrMatrixSize * sizeof(double));
+	//h_aggregatedCorrMatrix = (double*)malloc(size*2 * sizeof(double)); // Aggregated correlation matrix from GPU
 
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
 	demodulationCrossCorrelation << <gridSize, blockSize, sharedSegmentSize * sizeof(double) >> > (data, dataB, size, d_aggregatedCorrMatrix, sharedSegmentSize, totalThreads, demodulationWindowSize, corrMatrixSize, segmentSize);
+	// Record stop event and synchronize
 
 
 	// Perform matrix-vector multiplication using cuBLAS for reduding the aggregated correlation matrix
@@ -253,43 +256,41 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	checkCuda(cudaMemcpy(h_odata, d_reducedCorrMatrix, corrMatrixSize * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
 
 
-	checkCuda(cudaMemcpy(h_dataA, data, size / 2 * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
-	checkCuda(cudaMemcpy(h_dataB, dataB, size / 2 * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
-	checkCuda(cudaMemcpy(h_aggregatedCorrMatrix, d_aggregatedCorrMatrix,size*2 * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	//checkCuda(cudaMemcpy(h_dataA, data, size / 2 * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	//checkCuda(cudaMemcpy(h_dataB, dataB, size / 2 * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	//checkCuda(cudaMemcpy(h_aggregatedCorrMatrix, d_aggregatedCorrMatrix,size*2 * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+	//const int W = 8;
+	//const int segmentSizeH = 2 * W;                 // 16 per channel
+	//const int perChan = (int)(size / 2);           // 'size' is total across A+B
+	//const int numSegments = perChan / segmentSizeH; // safer than size/32
+	//const int corrSize = W * W;
+	//////// zero the accumulator
+	//for (int i = 0; i < corrSize; ++i) h_dataAB[i] = 0.0;
+	//for (int seg = 0; seg < numSegments; ++seg) {
+	//	const int base = seg * segmentSizeH; // per-channel base
+	//	for (int j = 0; j < W; ++j) {
+	//		const double da = (double)h_dataA[base + j] - (double)h_dataA[base + W + j]; // A0-A1
+	//		for (int k = 0; k < W; ++k) {
+	//			const double db = (double)h_dataB[base + k] - (double)h_dataB[base + W + k]; // B0-B1
+	//			const int idx = j * W + k;   // row-major to match GPU write
+	//			h_dataAB[idx] += da * db;    // accumulate across segments
+	//			//printf("%d\t%f\t%f\t%f\t%f\n",idx+ seg*64,da ,db, da * db, h_aggregatedCorrMatrix[idx + seg * 64]);
+	//		}
+	//	}
+	//}
+	//for (int i = 0; i < corrMatrixSize; ++i) {
+	//	h_dataAB[i] /= (double)size / 32;
+	//	if (h_dataAB[i]!= h_odata[i])	printf("CPU: %d\t%.10f\tGPU: %.10f\n", i, h_dataAB[i], h_odata[i]);
+	//	else
+	//	{
+	//	printf("Match %d\tCPU=GPU\n", i);
 
-
-	const int W = 8;
-	const int segmentSizeH = 2 * W;                 // 16 per channel
-	const int perChan = (int)(size / 2);           // 'size' is total across A+B
-	const int numSegments = perChan / segmentSizeH; // safer than size/32
-	const int corrSize = W * W;
-
-	// zero the accumulator
-	for (int i = 0; i < corrSize; ++i) h_dataAB[i] = 0.0;
-
-	for (int seg = 0; seg < numSegments; ++seg) {
-		const int base = seg * segmentSizeH; // per-channel base
-
-		for (int j = 0; j < W; ++j) {
-			const double da = (double)h_dataA[base + j] - (double)h_dataA[base + W + j]; // A0-A1
-			for (int k = 0; k < W; ++k) {
-				const double db = (double)h_dataB[base + k] - (double)h_dataB[base + W + k]; // B0-B1
-				const int idx = j * W + k;   // row-major to match GPU write
-				h_dataAB[idx] += da * db;    // accumulate across segments
-				//printf("%d\t%f\t%f\t%f\t%f\n",idx+ seg*64,da ,db, da * db, h_aggregatedCorrMatrix[idx + seg * 64]);
-			}
-		}
-	}
-
-	for (int i = 0; i < corrMatrixSize; ++i) {
-		h_dataAB[i] /= (double)size / 32;
-		if (h_dataAB[i]!= h_odata[i])	printf("CPU: %d\t%.10f\tGPU: %.10f\n", i, h_dataAB[i], h_odata[i]);
-	}
+	//	}
+	//}
 
 	// Wait for the GPU to finish
 	checkCuda(cudaDeviceSynchronize(), "Kernel execution failed");
 	
-
 
 	// Write results to Analysis file
 	if (AnalysisFile) {

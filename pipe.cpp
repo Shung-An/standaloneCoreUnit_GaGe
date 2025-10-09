@@ -1,7 +1,8 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <Windows.h>
 #include <stdlib.h>
 #include <iostream>
+#include <vector> 
 
 
 extern "C" HANDLE createAndConnectPipe(const char* pipeName, DWORD bufferSize) {
@@ -46,47 +47,78 @@ extern "C" bool CheckForRequest(HANDLE hPipe)
 }
 
 
-extern "C" int handleClientRequests(HANDLE hPipe, short* data, double* corrMatrix, int segmentIndex, DWORD bytesToSend, int choice)
+extern "C" int handleClientRequests(
+    HANDLE hPipe,
+    short* data,
+    short* dataB,
+    double* corrMatrix,
+    int segmentIndex,
+    DWORD bytesToSend,
+    int choice) // choice 0=data interleaved, 1=corrMatrix
 {
-	if (!CheckForRequest(hPipe))
-	{
-		//std::cerr << "No request.\n";
-		return 0;  // No data to process
-	}
+    if (!CheckForRequest(hPipe))
+        return 0;  // No request pending
 
-	// Read the client's request
-	short request;
-	DWORD bytesRead;
-	BOOL success = ReadFile(hPipe, &request, sizeof(request), &bytesRead, NULL);
-	if (!success || bytesRead != sizeof(request))
-	{
-		std::cerr << "Failed to read request from client.\n";
-		return 1;  // Error reading the request
-	}
+    // 1️⃣ Read client request
+    short request = -1;
+    DWORD bytesRead = 0;
+    BOOL success = ReadFile(hPipe, &request, sizeof(request), &bytesRead, NULL);
+    if (!success || bytesRead != sizeof(request)) {
+        std::cerr << "[Error] Failed to read request from client.\n";
+        return 1;
+    }
 
-	//std::cout << "Received request from client, sending data...\n";
+    DWORD bytesWritten = 0;
 
-	// Send a specific number of bytes of a specific segment of `data` or corrMatrix to the client
-	DWORD bytesWritten;
-	if (choice == 0) {
-		// Calculate the starting position for the segment to send
-		short* segmentStart = data + (segmentIndex * (bytesToSend / sizeof(short))); // Calculate the starting point
-		success = WriteFile(hPipe, segmentStart, bytesToSend, &bytesWritten, NULL);
-	}
-	else if(choice == 1) {
-		// Calculate the starting position for the segment to send
-		double* segmentStart = corrMatrix + (segmentIndex * (bytesToSend / sizeof(double))); // Calculate the starting point
-		success = WriteFile(hPipe, segmentStart, bytesToSend, &bytesWritten, NULL);
+    // 2️⃣ Interleaved data mode (choice == 0)
+    if (choice == 0)
+    {
+        // Number of samples per segment
+        size_t samplesPerSegment = bytesToSend / sizeof(short);
 
-	}
+        // Calculate start offsets
+        short* segA = data + segmentIndex * samplesPerSegment;
+        short* segB = dataB + segmentIndex * samplesPerSegment;
 
-	
-	if (!success || bytesWritten != bytesToSend)
-	{
-		std::cerr << "Failed to send data to client.\n";
-		return 1;  // Error sending the data
-	}
+        // Allocate temporary interleaved buffer (stack or heap)
+        std::vector<short> interleaved(samplesPerSegment * 2);
 
-	//std::cout << "Sent data to client.\n";
-	return 2;  // Successfully processed the request and sent data
+        // Interleave: A0,B0,A1,B1,...
+        for (size_t i = 0; i < samplesPerSegment; ++i)
+        {
+            interleaved[2 * i] = segA[i];
+            interleaved[2 * i + 1] = segB[i];
+        }
+
+        DWORD totalBytes = static_cast<DWORD>(interleaved.size() * sizeof(short));
+        success = WriteFile(hPipe, interleaved.data(), totalBytes, &bytesWritten, NULL);
+
+        if (!success || bytesWritten != totalBytes)
+        {
+            std::cerr << "[Error] Failed to send interleaved data.\n";
+            return 1;
+        }
+    }
+
+    // 3️⃣ Correlation matrix mode (choice == 1)
+    else if (choice == 1)
+    {
+        double* segC = corrMatrix + (segmentIndex * (bytesToSend / sizeof(double)));
+        success = WriteFile(hPipe, segC, bytesToSend, &bytesWritten, NULL);
+
+        if (!success || bytesWritten != bytesToSend)
+        {
+            std::cerr << "[Error] Failed to send correlation matrix.\n";
+            return 1;
+        }
+    }
+
+    else
+    {
+        std::cerr << "[Warning] Unknown choice parameter.\n";
+        return 1;
+    }
+
+    return 2;  // Successfully sent
 }
+
