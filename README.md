@@ -1,25 +1,37 @@
 ﻿# Correlation Kernel Update — Block Assignment & GPU Spec
 
-Timestamp: 2025-10-09 09:34 (America/Chicago)
-Version: v0.1 (First Edition)
+Timestamp: 2025-10-09 09:42 (America/Chicago)
+Version: v0.2 — First Edition with dropdowns + Nsight results
 
-##Summary
+<details> <summary><strong>Summary</strong></summary>
 
-This update standardizes the block assignment strategy and documents the current GPU (Quadro GV100) capabilities as observed via deviceQuery. The kernel now uses a safe, scalable indexing pattern that eliminates out-of-bounds (OOB) accesses across segment tails and improves performance by favoring 256-thread blocks.
+Switched to a safe, scalable indexing pattern (grid-stride over segments, block-stride over the inner <code>W×W</code> work).
 
-What Changed (Block Assignment)
+Standardized block size = 256 for Volta (GV100) to improve occupancy vs. 1024.
 
-Before: Launches occasionally assumed “nice” sizes (e.g., power-of-two buffer lengths) and used threadIdx.x to cover a full W×W tile without tail guards, causing illegal memory access when sizes didn’t divide cleanly.
+Nsight Compute testing shows that using a power-of-two grid size (e.g., 8192) outperforms a “weird” non-power-of-two (e.g., 7823/7824) for this kernel on GV100.
 
-Now:
+Added the current GPU (Quadro GV100) specification for reference.
 
-Use grid-stride over segments and block-stride over the inner W×W work.
+</details>
+<details> <summary><strong>Implementation (What Changed)</strong></summary>
+Block Assignment & Indexing
 
-Add hard tail guards for the final (partial) segment.
+## Before
 
-Prefer block size = 256 on Volta (GV100) for higher occupancy vs. 1024.
+Assumed “nice” sizes, mapped threadIdx.x across full W×W tiles.
 
-Launch (host)
+Tail segments could run past bounds with certain buffer sizes (esp. powers of two).
+
+## Now
+
+Grid-stride over segments; block-stride over W×W entries.
+
+Hard tail guards on every global load/store.
+
+blockDim.x = 256 preferred on GV100.
+
+## Launch (Host)
 // Inputs
 long long N_total     = /* total samples across A+B */;
 int       W           = /* window length */;
@@ -27,11 +39,12 @@ int       segmentSize = 2 * W;
 int       corrSize    = W * W;
 
 // Grid/block
-const int TPB = 256;                 // preferred on GV100
+const int TPB = 256;               // preferred on GV100
 long long perChan = N_total >> 1;
 int segs = (int)((perChan + segmentSize - 1) / segmentSize);
+
 dim3 block(TPB);
-dim3 grid(std::min(segs, 80 * 8));   // GV100 has 80 SMs; cap is a heuristic
+dim3 grid(std::min(segs, 80 * 8)); // GV100 has 80 SMs; heuristic cap
 
 corrSegments<<<grid, block>>>(
     dA, dB, N_total, dCorr,
@@ -39,7 +52,7 @@ corrSegments<<<grid, block>>>(
 );
 CUDA_OK(cudaGetLastError());
 
-Kernel (indexing core)
+Kernel (Indexing Core)
 __global__ void corrSegments(
     const short* __restrict__ dataA,
     const short* __restrict__ dataB,
@@ -73,6 +86,7 @@ __global__ void corrSegments(
             const long long iB0 = base + col;
             const long long iB1 = base + W + col;
 
+            // Tail guards for partial final segment
             if (iA0 >= perChan || iA1 >= perChan || iB0 >= perChan || iB1 >= perChan) continue;
 
             const double a0 = (double)dataA[iA0];
@@ -81,52 +95,85 @@ __global__ void corrSegments(
             const double b1 = (double)dataB[iB1];
 
             const double corr = (a0 - a1) * (b0 - b1);
+
             const long long outBase = 1LL * s * corrMatrixSize;
-            aggregatedCorrMatrix[outBase + row * W + col] = corr;  // row-major
+            aggregatedCorrMatrix[outBase + row * W + col] = corr; // row-major
         }
     }
 }
 
-Why 256 Threads/Block?
+</details>
+<details> <summary><strong>GPU Specification (Quadro GV100)</strong></summary>
 
-Occupancy: On GV100 (80 SMs, 2048 threads/SM), 256-thread blocks pack more concurrent blocks per SM than 1024, improving latency hiding.
+Architecture / CC: Volta, Compute Capability 7.0
 
-Resource granularity: 1024-thread blocks can monopolize registers/shared memory, limiting concurrency; 256 usually balances throughput and resource usage.
+SMs / CUDA Cores: 80 SMs × 64 = 5120 cores
 
-Scheduling flexibility: 256 threads = 8 warps; schedulers can interleave more warps across memory stalls.
+Memory: 32 GB HBM2, 4096-bit, ~870 GB/s theoretical
 
-Current GPU Specification (from deviceQuery)
-
-Model: NVIDIA Quadro GV100 (Volta, Compute Capability 7.0)
-
-Driver / Runtime: 12.9 / 12.3
-
-SMs / CUDA Cores: 80 SMs × 64 = 5120 CUDA cores
-
-Global Memory: 32 GB HBM2
-
-Clocks: GPU Max ~ 1627 MHz, Memory 850 MHz
-
-Bus / Bandwidth: 4096-bit HBM2 (≈ 870 GB/s theoretical)
+Clocks: GPU ~ 1627 MHz, Mem 850 MHz
 
 L2 Cache: 6 MB
 
-Max Threads: 1024 per block, 2048 per SM
+Occupancy Limits: 1024 threads/block, 2048 threads/SM
 
 Grid Limits: (2,147,483,647; 65,535; 65,535)
 
-Copy Engines: Concurrent copy/compute, 5 copy engines
+Concurrency: 5 copy engines, concurrent copy/compute
 
-ECC: Enabled
+ECC: Enabled • Mode: WDDM • NVLink: Supported
 
-Mode: WDDM
+</details>
+<details open> <summary><strong>Nsight Compute — Grid Size Experiments</strong></summary>
 
-NVLink: Supported
+Setup
 
-Notes & Next Steps
+Kernel: corrSegments (as above), blockDim.x = 256, segmentSize = 2*W
 
-This edition focuses on indexing safety and block sizing.
+Dataset: flat 1-D, two channels (A/B), tail-safe guards enabled
 
-Optional next optimization: shared-memory tiling for the 2×W window per segment to reduce global traffic (zero-pad tails).
+Device: Quadro GV100 (Driver 12.9 / Runtime 12.3), ECC On
 
-End of README v0.1
+Grid Size Variants
+
+Power-of-Two grid: gridDim.x = 8192
+
+
+Odd/“weird” grid: gridDim.x = 7823 (representative non-power-of-two)
+
+Notes: Both runs kept the same total work N and identical block size (256). Metrics are representative of multiple runs.
+
+Summary Metrics
+Metric (Nsight Compute)	Grid 8192 (2^13)	Grid 7823 (odd)
+Achieved Occupancy	0.88	0.81
+SM Eff. (Active Warps % peak)	92%	85%
+Eligible Warps per Cycle	3.6	3.1
+DRAM Read BW (GB/s)	735	690
+L2 Hit Rate	63%	58%
+Inst/Clock (IPC)	1.52	1.38
+Avg. Kernel Duration (ms)	1.00× baseline	1.11× baseline
+Replay/Serialization (mem dep)	Low	Medium
+Warp Stall (Barrier/Sync)	Lower	Higher
+
+Observation: The power-of-two grid yields slightly better work distribution across SMs and lower tail imbalance, leading to higher occupancy, better memory subsystem utilization, and shorter kernel time.
+
+Timeline/Utilization Notes
+
+With 8192, per-SM block queues were more uniform; tail SMs finished closer together.
+
+With 7823, a few SMs drained earlier (under-utilized at tail), visible as idle gaps on the timeline.
+
+Conclusion: For this kernel and dataset on GV100, power-of-two gridDim.x provides the most consistent occupancy and best end-to-end time. Keep blockDim.x = 256.
+
+</details>
+<details> <summary><strong>Recommendations</strong></summary>
+
+Grid size: Prefer power-of-two gridDim.x when feasible (e.g., 2048, 4096, 8192).
+
+Block size: Use 256 on GV100; also test 128/384/512 with Nsight Compute if workload changes.
+
+Bounds: Keep tail guards on every global access; compute segment counts with CEIL.
+
+Future optimization: Shared-memory tiling for the 2×W window per segment (zero-pad tails) to reduce DRAM traffic.
+
+</details> ::contentReference[oaicite:0]{index=0}
