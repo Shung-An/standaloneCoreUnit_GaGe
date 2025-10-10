@@ -40,55 +40,34 @@ __global__ void demodulationCrossCorrelation(
 	const int segmentSize                     // expected 2*W per channel
 )
 {
+	extern __shared__ double shared[];  // dynamic SMEM
+	double* sA = shared;                // [segmentSize] for A
+	double* sB = sA + segmentSize;      // [segmentSize] for B
 
+	const int s = blockIdx.x;           // segment index
+	const long long perChan = numElements >> 1;
+	const long long base = 1LL * s * segmentSize;
+	if (base >= perChan) return;
 
-	// ---- static sanity (once) ----
-	if (segmentSize != 2 * W || corrMatrixSize != W * W) return;
-
-	// Per-channel length; we assume the two channels are the same length
-	const long long perChan = numElements >> 1;  // (numElements / 2)
-
-	// How many full segments per channel (CEIL)
-	const int totalSegNum = (int)((perChan + segmentSize - 1) / segmentSize);
-
-	const int tid = threadIdx.x;
-	const int tpb = blockDim.x;
-	const int gdim = gridDim.x;
-
-	// ---- grid-stride over segments ----
-	for (int s = blockIdx.x; s < totalSegNum; s += gdim) {
-		const long long base = 1LL * s * segmentSize;
-
-		// If the whole segment is beyond perChan, skip safely.
-		if (base >= perChan) continue;
-
-		// ---- block-stride over the W*W inner work ----
-		for (int k = tid; k < W * W; k += tpb) {
-			const int row = k / W;   // 0..W-1
-			const int col = k % W;   // 0..W-1
-
-			// Global indices we will read
-			const long long iA0 = base + row;
-			const long long iA1 = base + W + row;
-			const long long iB0 = base + col;
-			const long long iB1 = base + W + col;
-
-			// Tail guards (last segment may be partial)
-			if (iA0 >= perChan || iA1 >= perChan || iB0 >= perChan || iB1 >= perChan)
-				continue;
-
-			// Loads
-			const double a0 = (double)dataA[iA0];
-			const double a1 = (double)dataA[iA1];
-			const double b0 = (double)dataB[iB0];
-			const double b1 = (double)dataB[iB1];
-
-			const double corr = (a0 - a1) * (b0 - b1);
-
-			// Write result for this segment into its W×W tile (row-major)
-			const long long outBase = 1LL * s * corrMatrixSize;
-			aggregatedCorrMatrix[outBase + row * W + col] = corr;
+	// load segment into shared memory
+	for (int i = threadIdx.x; i < segmentSize; i += blockDim.x) {
+		if (base + i < perChan) {
+			sA[i] = (double)dataA[base + i];
+			sB[i] = (double)dataB[base + i];
 		}
+	}
+	__syncthreads();
+
+	// compute correlation tile (W×W)
+	for (int k = threadIdx.x; k < W * W; k += blockDim.x) {
+		int row = k / W;
+		int col = k % W;
+
+		if (row + W >= segmentSize || col + W >= segmentSize)
+			continue;
+
+		double corr = (sA[row] - sA[row + W]) * (sB[col] - sB[col + W]);
+		aggregatedCorrMatrix[s * corrMatrixSize + row * W + col] = corr;
 	}
 }
 
@@ -284,7 +263,6 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	//	else
 	//	{
 	//	printf("Match %d\tCPU=GPU\n", i);
-
 	//	}
 	//}
 

@@ -484,7 +484,7 @@ int _tmain()
 	if (0 == Prepare_Cleanup())
 	{
 		CsFreeSystem(g_hSystem[0]);
-		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[1]);
 		return (-1);
 	}
 
@@ -681,11 +681,11 @@ int _tmain()
 	}
 
 	// Check some events to see if there was any errors
-	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[0], 0))
+	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[0], 0)|| WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[1], 0))
 	{
 		_ftprintf(stdout, _T("\nStream aborted on error.\n"));
 	}
-	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0))
+	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0)|| WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[1], 0))
 	{
 		_ftprintf(stdout, _T("\nStream aborted by user.\n"));
 	}
@@ -1646,9 +1646,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			}
 
 			// Check if user has aborted or an error has occured
-			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort, 0))
+			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0)|| WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[1], 0))
 				break;
-			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError, 0))
+			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0) || WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[1], 0))
 				break;
 
 
@@ -1821,7 +1821,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 				if (0 != u32ErrorFlag1 && 0 != u32ErrorFlag2)
 				{
-					if (STM_TRANSFER_ERROR_FIFOFULL & u32ErrorFlag1)
+					if (STM_TRANSFER_ERROR_FIFOFULL & u32ErrorFlag1 & u32ErrorFlag2)
 					{
 						// The Fifo full error has occured at the card level which results data lost.
 						// This error occurs when the application is not fast enough to transfer data.
@@ -1847,7 +1847,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 							// Do nothing here, go backto the loop CsStmTransferToBuffer() CsStmGetTransferStatus()
 						}
 					}
-					if (u32ErrorFlag1 & STM_TRANSFER_ERROR_CHANNEL_PROTECTION)
+					if (u32ErrorFlag1 & u32ErrorFlag2 & STM_TRANSFER_ERROR_CHANNEL_PROTECTION)
 					{
 						// Channel protection error as coccrued
 						SetEvent(g_hStreamError[0]);
