@@ -78,6 +78,7 @@ typedef struct
 #define GPU_SECTION _T("GpuConfig")		/* section name in ini file */
 #define EXP_SECTION _T("ExpConfig")	/* section name in ini file */
 
+#define MAX_SYS 2
 
 #define RESULTS_FILE _T("Result")
 #define	MEMORY_ALIGNMENT 4096
@@ -86,6 +87,7 @@ typedef struct
 #define DEFAULT_SKIP_FACTOR 1
 #define DEFAULT_DO_ANALYSIS 1
 #define DEFAULT_USE_GPU 1
+
 
 typedef struct
 {
@@ -118,7 +120,7 @@ uInt32 GetSectorSize();
 
 void  UpdateProgress(uInt32 u32Elapsed, LONGLONG llTotaBytes, FILE* AnalysisFile);
 int32 LoadStmConfiguration(LPCTSTR szIniFile, PCSSTMCONFIG pConfig);
-DWORD WINAPI CardStreamThread(void* CardIndex);
+DWORD WINAPI CardStreamThread(LPVOID lpParam);
 BOOL Prepare_Cleanup();
 
 #ifdef __cplusplus
@@ -206,10 +208,10 @@ void VerifyData(void* buffer, int64 size, unsigned int sample_size);
 HANDLE						g_hThread[2] = { 0 ,0};
 LONGLONG					g_llCardTotalData[MAX_CARDS_COUNT] = { 0 };
 LONGLONG					g_llTotalSamplesConfig = 0;
-HANDLE						g_hStreamStarted[2] = { 0,0 };
-HANDLE						g_hStreamAbort[2] = { 0,0 };
-HANDLE						g_hStreamError[2] = { 0,0 };
-HANDLE						g_hThreadReadyForStream[2] = {0,0};
+HANDLE						g_hThreadReadyForStream[MAX_SYS]; // signaled by worker when ready
+HANDLE						g_hStreamStarted[MAX_SYS];        // signaled by main to start a worker
+HANDLE						g_hStreamAbort[MAX_SYS];          // signaled by main/worker to stop
+HANDLE						g_hStreamError[MAX_SYS];          // signaled by worker on error
 CSHANDLE					g_hSystem[2] = {0,0};
 CSSYSTEMINFO				g_CsSysInfo = { 0 };
 CSACQUISITIONCONFIG			g_CsAcqCfg = { 0 };
@@ -218,6 +220,13 @@ CSGPUCONFIG					g_GpuConfig = { 0 };	// GPU configuration
 EXPCONFIG					g_ExpConfig;	// Experiment configuration
 CS_STRUCT_DATAFORMAT_INFO	g_DataFormatInfo = { 0 };
 double						diff_time[MAX_CARDS_COUNT] = { 0. };
+
+typedef struct {
+	int  systemIdx;     // 0 or 1
+	CSHANDLE hSystem;   // g_hSystem[systemIdx]
+	uInt16 cardIndex;   // always 1 for single-card boards
+} ThreadArg;
+
 
 int _tmain()
 {
@@ -244,6 +253,8 @@ int _tmain()
 	cudaError_t					cudaStatus = cudaSuccess;
 	int64						i64TickFrequency = 0;
 	int							display_result = 1;
+
+	int nSystems = 0;
 
 
 	clock_t pre_start_time, pre_current_time;
@@ -272,12 +283,21 @@ int _tmain()
 		DisplayErrorString(i32Status);
 		return (-1);
 	}
-
+	nSystems++;
 	i32Status = CsGetSystem(&g_hSystem[1], 0, 0, 0, 0);
 	if (CS_FAILED(i32Status))
 	{
 		DisplayErrorString(i32Status);
 		return (-1);
+	}
+	nSystems++;
+
+	ThreadArg* args = (ThreadArg*)calloc(nSystems, sizeof * args);  // persists
+
+	for (int i = 0; i < nSystems; ++i) {
+		args[i].systemIdx = i;
+		args[i].hSystem = g_hSystem[i];
+		args[i].cardIndex = 1;
 	}
 
 	// Get System information. The u32Size field must be filled in
@@ -490,21 +510,7 @@ int _tmain()
 
 
 	// Create events for stream data acquisition
-	g_hStreamStarted[0] = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hStreamAbort[0] = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hStreamError[0] = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hThreadReadyForStream[0] = CreateEvent(NULL, FALSE, FALSE, NULL);
-	g_hStreamStarted[1] = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hStreamAbort[1] = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hStreamError[1] = CreateEvent(NULL, TRUE, FALSE, NULL);
-	g_hThreadReadyForStream[1] = CreateEvent(NULL, FALSE, FALSE, NULL);
-	if (NULL == g_hStreamStarted[0] || NULL == g_hStreamAbort[0] || NULL == g_hStreamError[0] || NULL == g_hThreadReadyForStream[0]|| NULL == g_hStreamStarted[1] || NULL == g_hStreamAbort[1] || NULL == g_hStreamError[1] || NULL == g_hThreadReadyForStream[1])
-	{
-		_ftprintf(stderr, _T("\nUnable to create events for synchronization.\n"));
-		CsFreeSystem(g_hSystem[0]);
-		CsFreeSystem(g_hSystem[1]);
-		return (-1);
-	}
+	InitEvents(nSystems);
 
 	// Commit the values to the driver.  This is where the values get sent to the
 	// hardware.  Any invalid parameters will be caught here and an error returned.
@@ -553,15 +559,15 @@ int _tmain()
 	//  Create threads for Stream. In M/S system, we have to create one thread per card
 	//for (n = 1, i = 0; n <= CsSysInfo.u32BoardCount; n++, i++)
 	// 2 cards in the same CardStreamThread 
-	for (n = 1, i = 0; n <= 1; n++, i++)
+	for (int i = 0; i < nSystems; ++i)
 	{
-		g_hThread[i] = (HANDLE)CreateThread(NULL, 0, CardStreamThread, &n, 0, &dwThreadId);
+		g_hThread[i] = (HANDLE)CreateThread(NULL, 0, CardStreamThread, &args[i], 0, &dwThreadId);
 		if ((HANDLE)(INT_PTR)-1 == g_hThread[i])
 		{
 			// Fail to create the streaming thread for the n card.
 			// Set the event g_hStreamAbort to terminate all threads
 			SetEvent(g_hStreamAbort[i]);
-			_ftprintf(stderr, _T("\nUnable to create thread for card %d."), n);
+			_ftprintf(stderr, _T("\nUnable to create thread for card %d."), i);
 			CsFreeSystem(g_hSystem[i]);
 			return (-1);
 		}
@@ -572,7 +578,7 @@ int _tmain()
 			{
 				// Something is wrong. It is not suppose to take that long
 				// Set the event g_hStreamAbort to terminate all threads
-				_ftprintf(stderr, _T("\nThread initialization error on card %d."), n);
+				_ftprintf(stderr, _T("\nThread initialization error on card %d."), i);
 				SetEvent(g_hStreamAbort[i]);
 				CsFreeSystem(g_hSystem[i]);
 				return (-1);
@@ -601,9 +607,9 @@ int _tmain()
 
 	// Set the event g_hStreamStarted so that the other threads can start to transfer data
 	Sleep(g_StreamConfig.u32DelayStartTransfer);		// Only for debug
-	SetEvent(g_hStreamStarted[0]);
-	SetEvent(g_hStreamStarted[1]);
-
+	for (int i = 0; i < nSystems; ++i) {
+		SetEvent(g_hStreamStarted[i]);
+	}
 	pre_current_time = clock();
 	pre_time = ((double)(pre_current_time - pre_start_time)) / CLOCKS_PER_SEC * 1000;
 	printf("Prepare Time: %.2f ms\n", pre_time);
@@ -619,8 +625,7 @@ int _tmain()
 			switch (toupper(_getch()))
 			{
 			case 27:			// ESC key -> abort
-				SetEvent(g_hStreamAbort[0]);
-				SetEvent(g_hStreamAbort[1]);
+				SetEvent(g_hStreamAbort[i]);
 				bDone = TRUE;
 				break;
 			case 'F':			// F key -> force trigger
@@ -635,8 +640,7 @@ int _tmain()
 		// Quit if elapsed time greater than our setting. 
 		if (u32TickNow - u32TickStart >= g_StreamConfig.u32TimeCounter)
 		{
-			SetEvent(g_hStreamAbort[0]);
-			SetEvent(g_hStreamAbort[1]);
+			SetEvent(g_hStreamAbort[i]);
 			bDone = TRUE;
 		}
 
@@ -681,11 +685,11 @@ int _tmain()
 	}
 
 	// Check some events to see if there was any errors
-	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[0], 0)|| WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[1], 0))
+	if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[i], 0))
 	{
 		_ftprintf(stdout, _T("\nStream aborted on error.\n"));
 	}
-	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0)|| WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamError[1], 0))
+	else if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[i], 0))
 	{
 		_ftprintf(stdout, _T("\nStream aborted by user.\n"));
 	}
@@ -729,7 +733,7 @@ int _tmain()
 		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize, AnalysisFile);
 	}
 
-
+	free(args);
 	return 0;
 }
 
@@ -774,6 +778,26 @@ BOOL isChannelValid(uInt32 u32ChannelIndex, uInt32 u32mode, uInt16 u16cardIndex,
 
 /***************************************************************************************************
 ****************************************************************************************************/
+
+static int InitEvents(int nSystems) {
+	for (int i = 0; i < nSystems; ++i) {
+		// auto-reset, not signaled
+		g_hThreadReadyForStream[i] = CreateEvent(NULL, /*bManualReset*/FALSE, FALSE, NULL);
+		// auto-reset, not signaled (start is a one-shot poke)
+		g_hStreamStarted[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+		// manual-reset, not signaled (once set, stays set so everyone sees abort)
+		g_hStreamAbort[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
+		// manual-reset, not signaled (latched error flag)
+		g_hStreamError[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+		if (!g_hThreadReadyForStream[i] || !g_hStreamStarted[i] ||
+			!g_hStreamAbort[i] || !g_hStreamError[i]) {
+			return -1; // handle error/log GetLastError()
+		}
+	}
+	return 0;
+}
+
 
 uInt32 GetSectorSize()
 {
@@ -1104,10 +1128,13 @@ cudaError_t InitializeCudaDevice(int32 nDevice, int32* i32MaxBlocks, int32* i32M
 /***************************************************************************************************
 ****************************************************************************************************/
 
-DWORD WINAPI CardStreamThread(void* CardIndex)
+DWORD WINAPI CardStreamThread(LPVOID lpParam)
 {
-	uInt16 nCardIndex = *((uInt16*)CardIndex);
-
+	ThreadArg* arg = (ThreadArg*)lpParam;   // lpParam is already the pointer you passed
+	if (!arg) return 0;
+	const int    i = arg->systemIdx;        // 0 or 1
+	CSHANDLE     h = arg->hSystem;
+	const uInt16 nCardIndex = arg->cardIndex; // usually 1
 
 
 	void* pBuffer11 = NULL; // Pointer to the buffer for card 1
@@ -1167,6 +1194,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	DWORD				dwRetCode = 0;
 	DWORD				dwBytesSave = 0;
 	HANDLE				hFile = NULL;
+	HANDLE				hFile2 = NULL;
 	BOOL				bWriteSuccess = TRUE;
 	DWORD				dwFileFlag = g_StreamConfig.bFileFlagNoBuffering ? FILE_FLAG_NO_BUFFERING : 0;
 	TCHAR				szSaveFileName[MAX_PATH];
@@ -1226,14 +1254,21 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 	}
 
 
-	sprintf_s(szSaveFileName, sizeof(szSaveFileName), "%s_%d.dat", g_StreamConfig.strResultFile, nCardIndex);
+	sprintf_s(szSaveFileName, sizeof(szSaveFileName), "%s_%d.dat", g_StreamConfig.strResultFile, 1);
 
 	if (g_StreamConfig.bSaveToFile)
 	{
-		//If there is an header, the file exist and we must keep the file and don't overwrite it
-		hFile = CreateFile(szSaveFileName, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, dwFileFlag, NULL);
+		DWORD disp = CREATE_ALWAYS;
+		DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE; // safer with AV/indexers
+		hFile = CreateFile(_T("Data_1.dat"), GENERIC_READ | GENERIC_WRITE, share, NULL, disp, dwFileFlag, NULL);
+		hFile2 = CreateFile(_T("Data_2.dat"), GENERIC_READ | GENERIC_WRITE, share, NULL, disp, dwFileFlag, NULL);
 		if (INVALID_HANDLE_VALUE == hFile)
 		{
+			DWORD e = GetLastError();
+			TCHAR cwd[MAX_PATH];
+			GetCurrentDirectory(MAX_PATH, cwd);
+			_ftprintf(stderr, _T("\nCreateFile failed for Data_1.dat. GetLastError=%lu (cwd=%s)\n"), e, cwd);
+
 			_ftprintf(stderr, _T("\nUnable to create data file.\n"));
 			ExitThread(1);
 		}
@@ -1445,29 +1480,22 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 		// So far so good ...
 		// Let the main thread know that this thread is ready for stream
-		SetEvent(g_hThreadReadyForStream[0]);
-		SetEvent(g_hThreadReadyForStream[1]);
+	// this worker is ready
+		SetEvent(g_hThreadReadyForStream[i]);
 
 
 		// Wait for the start acquisition event from the main thread
-		WaitEvents[0] = g_hStreamStarted[0];
-		WaitEvents[1] = g_hStreamStarted[1];
-		WaitEvents[2] = g_hStreamAbort[0];
-		WaitEvents[3] = g_hStreamAbort[1];
 
-
-
-	
-
-		dwWaitStatus = WaitForMultipleObjects(4, WaitEvents, FALSE, INFINITE);
-
-		if ((WAIT_OBJECT_0 + 1) == dwWaitStatus)
+		// wait for either start or abort (ONLY this system's events)
+		HANDLE ev[2] = { g_hStreamStarted[i], g_hStreamAbort[i] };
+		DWORD dw = WaitForMultipleObjects(2, ev, FALSE, INFINITE);
+		if (dw == WAIT_OBJECT_0 + 1)
 		{
 			// Aborted from user or error
 			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer11);
 			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer12);
 			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer21);
-			CsStmFreeBuffer(g_hSystem[0], nCardIndex, pBuffer22);
+			CsStmFreeBuffer(g_hSystem[1], nCardIndex, pBuffer22);
 			CloseHandle(hFile);
 			if (g_GpuConfig.bUseGpu)
 			{
@@ -1484,14 +1512,14 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 
 		// Convert the transfer size to BYTEs or WORDs depending on the card.
 		u32TransferSizeSamples = g_StreamConfig.u32BufferSizeBytes / g_CsSysInfo.u32SampleSize ;
-		int u32TransferSizeSamples1 = 0;
+		int u32TransferSizeSamplesGPU = 0;
 
-		u32TransferSizeSamples1 = u32TransferSizeSamples*2;
+		u32TransferSizeSamplesGPU = u32TransferSizeSamples*2;
 
 		segmentSize = demodulationWindowSize * 2;												// Size of one segment in the input data
 		corrMatrixSize = demodulationWindowSize * demodulationWindowSize;				// Size of the correlation matrix 
-		totalSegNum = u32TransferSizeSamples1 / segmentSize/2;										// Total number of segments in the data transfer
-		totalThreads = u32TransferSizeSamples1 * demodulationWindowSize / 4;					// Total number of threads lanuched in the kernel
+		totalSegNum = u32TransferSizeSamplesGPU / segmentSize/2;										// Total number of segments in the data transfer
+		totalThreads = u32TransferSizeSamplesGPU * demodulationWindowSize / 4;					// Total number of threads lanuched in the kernel
 		sharedSegmentSize = blockSize * 4 / demodulationWindowSize;							// Size of the shared memory segment of one block
 		gridSize = (totalThreads + blockSize - 1) / blockSize;								// Number of blocks in the grid
 
@@ -1646,9 +1674,9 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 			}
 
 			// Check if user has aborted or an error has occured
-			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0)|| WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[1], 0))
+			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[i], 0))
 				break;
-			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[0], 0) || WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[1], 0))
+			if (WAIT_OBJECT_0 == WaitForSingleObject(g_hStreamAbort[i], 0))
 				break;
 
 
@@ -1707,7 +1735,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
 							(short*)d_buffer1,
 							(short*)d_buffer2,
-							u32TransferSizeSamples1,
+							u32TransferSizeSamplesGPU,
 							totalThreads,
 							gridSize,
 							blockSize,
@@ -1730,7 +1758,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
 							(short*)d_buffer1,
 							(short*)d_buffer2,
-							u32TransferSizeSamples1,
+							u32TransferSizeSamplesGPU,
 							totalThreads,
 							gridSize,
 							blockSize,
@@ -1786,6 +1814,7 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 				// While data transfer of the current buffer is in progress, save the data from pWorkBuffer to hard disk
 				dwBytesSave = 0;
 				bWriteSuccess = WriteFile(hFile, pWorkBuffer1, g_StreamConfig.u32BufferSizeBytes, &dwBytesSave, NULL);
+				bWriteSuccess = WriteFile(hFile2, pWorkBuffer2, g_StreamConfig.u32BufferSizeBytes, &dwBytesSave, NULL);
 				if (!bWriteSuccess || dwBytesSave != g_StreamConfig.u32BufferSizeBytes)
 				{
 					_ftprintf(stdout, _T("\nWriteFile() error on card %d !!! (GetLastError() = 0x%x\n"), nCardIndex, GetLastError());
@@ -1945,7 +1974,11 @@ DWORD WINAPI CardStreamThread(void* CardIndex)
 		}
 		// Close the data file and free all streaming buffers
 		if (g_StreamConfig.bSaveToFile)
+		{
 			CloseHandle(hFile);
+			CloseHandle(hFile2);
+		}
+
 
 		if (g_GpuConfig.bUseGpu)
 		{
@@ -2013,6 +2046,7 @@ BOOL Prepare_Cleanup()
 	BOOL		bSuccess = TRUE;
 	TCHAR		szSaveFileName[MAX_PATH];
 	HANDLE		hFile = NULL;
+	HANDLE		hFile2 = NULL;
 
 	if (g_StreamConfig.bSaveToFile)
 	{
@@ -2021,9 +2055,11 @@ BOOL Prepare_Cleanup()
 			sprintf_s(szSaveFileName, sizeof(szSaveFileName), "%s_%d.dat", g_StreamConfig.strResultFile, n);
 			// Check if the file exists on the HDD
 			hFile = CreateFile(szSaveFileName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+			hFile2 = CreateFile("Data_2.dat", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 			if (INVALID_HANDLE_VALUE != hFile)
 			{
 				CloseHandle(hFile);
+				CloseHandle(hFile2);
 				bSuccess = DeleteFile(szSaveFileName);
 				if (!bSuccess)
 				{
