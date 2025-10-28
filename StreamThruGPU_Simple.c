@@ -1727,6 +1727,19 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 				QueryPerformanceCounter(&transfer_start_time);  // mark the start time of data transfer and processing
 
 			i32Status = CsStmTransferToBuffer(g_hSystem[0], 1, pCurrentBuffer1, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
+			if (CS_FAILED(i32Status))
+			{
+				if (CS_STM_COMPLETED == i32Status)
+					bStreamCompletedSuccess = TRUE;
+				else
+				{
+					SetEvent(g_hStreamError);
+					DisplayErrorString(i32Status);
+				}
+				break;
+			}
+
+			
 			i32Status = CsStmTransferToBuffer(g_hSystem[1], 1, pCurrentBuffer2, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
 
 			if (CS_FAILED(i32Status))
