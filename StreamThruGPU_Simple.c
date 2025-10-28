@@ -234,6 +234,8 @@ int _tmain()
 	uInt32						u32Mode;
 	CSSYSTEMINFO				CsSysInfo = { 0 };
 	LPCTSTR						szIniFile = _T("StreamThruGPU.ini");
+
+
 	BOOL						bDone = FALSE;
 	long long					llSystemTotalData = 0;
 	uInt16						n;
@@ -338,6 +340,7 @@ int _tmain()
 	i32Status = CsAs_ConfigureSystem(g_hSystem[0], (int)CsSysInfo.u32ChannelCount,
 		(int)CalculateTriggerCountFromConfig(&CsSysInfo, (LPCTSTR)szIniFile),
 		(LPCTSTR)szIniFile, &u32Mode);
+
 	if (CS_FAILED(i32Status))
 	{
 		if (CS_INVALID_FILENAME == i32Status)
@@ -515,6 +518,13 @@ int _tmain()
 	// Commit the values to the driver.  This is where the values get sent to the
 	// hardware.  Any invalid parameters will be caught here and an error returned.
 	i32Status = CsDo(g_hSystem[0], ACTION_COMMIT);
+	if (CS_FAILED(i32Status))
+	{
+		DisplayErrorString(i32Status);
+		CsFreeSystem(g_hSystem[0]);
+		CsFreeSystem(g_hSystem[1]);
+		return (-1);
+	}
 	i32Status = CsDo(g_hSystem[1], ACTION_COMMIT);
 	if (CS_FAILED(i32Status))
 	{
@@ -523,6 +533,8 @@ int _tmain()
 		CsFreeSystem(g_hSystem[1]);
 		return (-1);
 	}
+
+
 
 	// After ACTION_COMMIT, the sample size may change.
 	// Get user's acquisition data to use for various parameters for transfer
@@ -588,13 +600,6 @@ int _tmain()
 
 	// Start the streaming data acquisition
 	printf("\nStart streaming. Press ESC to abort\n\n");
-	i32Status = CsDo(g_hSystem[0], ACTION_START);
-	if (CS_FAILED(i32Status))
-	{
-		DisplayErrorString(i32Status);
-		CsFreeSystem(g_hSystem[0]);
-		return (-1);
-	}
 	i32Status = CsDo(g_hSystem[1], ACTION_START);
 	if (CS_FAILED(i32Status))
 	{
@@ -602,6 +607,17 @@ int _tmain()
 		CsFreeSystem(g_hSystem[1]);
 		return (-1);
 	}
+	
+	i32Status = CsDo(g_hSystem[0], ACTION_START);
+	if (CS_FAILED(i32Status))
+	{
+		DisplayErrorString(i32Status);
+		CsFreeSystem(g_hSystem[0]);
+		return (-1);
+	}
+
+
+
 
 	u32TickStart = u32TickNow = GetTickCount();
 
@@ -662,6 +678,8 @@ int _tmain()
 
 		UpdateProgress(u32TickNow - u32TickStart, llSystemTotalData * g_CsSysInfo.u32SampleSize, NULL);
 	}
+
+
 
 	//	Abort the current acquisition 
 	CsDo(g_hSystem[0], ACTION_ABORT);
@@ -824,7 +842,7 @@ int32 InitializeStream(CSHANDLE hSystem)
 
 	CsAcqCfg.u32Size = sizeof(CSACQUISITIONCONFIG);
 
-	// Get user's acquisition Data
+		// Get user's acquisition Data
 	i32Status = CsGet(hSystem, CS_ACQUISITION, CS_CURRENT_CONFIGURATION, &CsAcqCfg);
 	if (CS_FAILED(i32Status))
 	{
@@ -832,7 +850,7 @@ int32 InitializeStream(CSHANDLE hSystem)
 		return (i32Status);
 	}
 
-	// Check if selected system supports Expert Stream
+		// Check if selected system supports Expert Stream
 	// And set the correct image to be used.
 	CsGet(hSystem, CS_PARAMS, CS_EXTENDED_BOARD_OPTIONS, &i64ExtendedOptions);
 
@@ -855,7 +873,11 @@ int32 InitializeStream(CSHANDLE hSystem)
 
 	// Sets the Acquisition values down the driver, without any validation, 
 	// for the Commit step which will validate system configuration.
+	if (hSystem == 131083) CsAcqCfg.i64TriggerDelay = 2080;
+	if (hSystem == 131084) CsAcqCfg.i64TriggerDelay = 1024;
+
 	i32Status = CsSet(hSystem, CS_ACQUISITION, &CsAcqCfg);
+
 	if (CS_FAILED(i32Status))
 	{
 		DisplayErrorString(i32Status);
@@ -1961,6 +1983,7 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 
 			// Save the data from pWorkBuffer to hard disk
 			bWriteSuccess = WriteFile(hFile, pWorkBuffer1, u32WriteSize, &dwBytesSave, NULL);
+			bWriteSuccess = WriteFile(hFile2, pWorkBuffer2, u32WriteSize, &dwBytesSave, NULL);
 			if (!bWriteSuccess || dwBytesSave != u32WriteSize)
 			{
 				_ftprintf(stdout, _T("\nWriteFile() error on card %d !!! (GetLastError() = 0x%x\n"), nCardIndex, GetLastError());

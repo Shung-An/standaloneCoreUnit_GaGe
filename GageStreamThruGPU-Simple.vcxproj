@@ -94,6 +94,7 @@
     <CudaCompile Include="DSPEquation_Simple_GPU.cu" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\..\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\ConfigSystem.c" />
     <ClCompile Include="C:\Program Files (x86)\Gage\CompuScope\CompuScope C SDK\C Common\CsSdkMisc.c" />
     <ClCompile Include="DSPEquation_Simple_CPU.c" />
     <ClCompile Include="pipe.cpp" />
