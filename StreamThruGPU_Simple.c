@@ -600,6 +600,10 @@ int _tmain()
 
 	// Start the streaming data acquisition
 	printf("\nStart streaming. Press ESC to abort\n\n");
+
+	
+
+
 	i32Status = CsDo(g_hSystem[1], ACTION_START);
 	if (CS_FAILED(i32Status))
 	{
@@ -607,7 +611,7 @@ int _tmain()
 		CsFreeSystem(g_hSystem[1]);
 		return (-1);
 	}
-	
+
 	i32Status = CsDo(g_hSystem[0], ACTION_START);
 	if (CS_FAILED(i32Status))
 	{
@@ -615,9 +619,6 @@ int _tmain()
 		CsFreeSystem(g_hSystem[0]);
 		return (-1);
 	}
-
-
-
 
 	u32TickStart = u32TickNow = GetTickCount();
 
@@ -1726,6 +1727,23 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 			if (timer == TRUE)
 				QueryPerformanceCounter(&transfer_start_time);  // mark the start time of data transfer and processing
 
+	
+			
+			i32Status = CsStmTransferToBuffer(g_hSystem[1], 1, pCurrentBuffer2, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
+
+
+			if (CS_FAILED(i32Status))
+			{
+				if (CS_STM_COMPLETED == i32Status)
+					bStreamCompletedSuccess = TRUE;
+				else
+				{
+					SetEvent(g_hStreamError);
+					DisplayErrorString(i32Status);
+					printf("%d Error on card 1!!!", u32LoopCount);
+				}
+				break;
+			}
 			i32Status = CsStmTransferToBuffer(g_hSystem[0], 1, pCurrentBuffer1, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
 			if (CS_FAILED(i32Status))
 			{
@@ -1735,31 +1753,107 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 				{
 					SetEvent(g_hStreamError);
 					DisplayErrorString(i32Status);
+					printf("%d Error on card 1!!!", u32LoopCount);
 				}
 				break;
 			}
-
-			
-			i32Status = CsStmTransferToBuffer(g_hSystem[1], 1, pCurrentBuffer2, u32TransferSizeSamples);    // Start to Transfer data from the card to the buffer
-
-			if (CS_FAILED(i32Status))
-			{
-				if (CS_STM_COMPLETED == i32Status)
-					bStreamCompletedSuccess = TRUE;
-				else
-				{
-					SetEvent(g_hStreamError);
-					DisplayErrorString(i32Status);
-				}
-				break;
-			}
-
+	
 
 			// do processing here on dbuffer
 
 			if (NULL != d_buffer1|| NULL != d_buffer2)
 			{
-				if (g_GpuConfig.bUseGpu)
+
+				// ============================================================
+// 1. One-time calibration on loop 1
+// ============================================================
+				static BOOL  cal_done = FALSE;
+				static int   cal_edge0 = -1;   // Data_1 ch2 rising edge
+				static int   cal_edge1 = -1;   // Data_2 ch1 rising edge
+				static int   skip0_samples = 0;    // how many samples to skip for card 0
+				static int   skip1_samples = 0;    // how many samples to skip for card 1
+				const  int   target_idx = 89;   // lock edge here
+				const  int   nChan = 2;    // interleaved ABAB → 2 channels
+				const  int   calChan0 = 1;    // Data_1 ch2 -> index 1
+				const  int   calChan1 = 0;    // Data_2 ch1 -> index 0
+				// -------------------------------------------------
+				// 1) One-time calibration using HOST work buffers
+				// -------------------------------------------------
+				// u32LoopCount here is the *current* loop count before increment.
+				// pWorkBuffer1/2 are set at the end of the previous loop, so:
+				//   - on loop 1, pWorkBuffer* are still NULL → skip
+				//   - on loop 2, pWorkBuffer* contain data from loop 1 → calibrate
+				if (!cal_done && u32LoopCount == 1 && pWorkBuffer1 && pWorkBuffer2)
+				{
+					const int nChan = 2;   // interleaved A B A B
+					const int calChan0 = 1;   // Data_1 ch2 (card 0) -> index 1
+					const int calChan1 = 0;   // Data_2 ch1 (card 1) -> index 0
+
+					short* p0 = (short*)pWorkBuffer1;   // *** HOST memory, not d_buffer1 ***
+					short* p1 = (short*)pWorkBuffer2;   // *** HOST memory, not d_buffer2 ***
+
+					int totalSamples = (int)u32TransferSizeSamples;    // samples per card
+					int nFrames = totalSamples / nChan;          // frames per channel
+					int maxFrames = (nFrames > 2048) ? 2048 : nFrames;
+
+					// --- min/max for thresholds ---
+					double lo0 = 15000, hi0 = 0;
+					double lo1 = 15000, hi1 = 0;
+
+					for (int i = 0; i < maxFrames; ++i)
+					{
+						double v0 = (double)p0[i * nChan + calChan0];
+						double v1 = (double)p1[i * nChan + calChan1];
+
+					}
+
+					double thr0 = 0.5 * (lo0 + hi0);
+					double thr1 = 0.5 * (lo1 + hi1);
+
+					// --- find rising edge Data_1 ch2 ---
+					cal_edge0 = -1;
+					for (int i = 1; i < maxFrames; ++i)
+					{
+						double prev = (double)p0[(i - 1) * nChan + calChan0];
+						double curr = (double)p0[i * nChan + calChan0];
+						if (prev < thr0 && curr >= thr0)
+						{
+							cal_edge0 = i;
+							break;
+						}
+					}
+
+					// --- find rising edge Data_2 ch1 ---
+					cal_edge1 = -1;
+					for (int i = 1; i < maxFrames; ++i)
+					{
+						double prev = (double)p1[(i - 1) * nChan + calChan1];
+						double curr = (double)p1[i * nChan + calChan1];
+						if (prev < thr1 && curr >= thr1)
+						{
+							cal_edge1 = i;
+							break;
+						}
+					}
+
+					printf("\nCAL: Data_1 ch2 rising frame = %d, Data_2 ch1 rising frame = %d, Δ = %d frames\n",
+						cal_edge0, cal_edge1, cal_edge1 - cal_edge0);
+
+					// Compute recommended skips to lock edges at frame 89 in host indexing
+					const int target_frame = 93;
+					if (cal_edge0 > 0)
+						skip0_samples = (cal_edge0 > target_frame ? (cal_edge0 - target_frame) * nChan : 0);
+					if (cal_edge1 > 0)
+						skip1_samples = (cal_edge1 > target_frame ? (cal_edge1 - target_frame) * nChan : 0);
+
+					printf("CAL: suggested skip0 = %d samples, skip1 = %d samples (per card)\n",
+						skip0_samples, skip1_samples);
+
+					cal_done = TRUE;
+				}
+
+
+				if (g_GpuConfig.bUseGpu && u32LoopCount>1)
 				{
 
 					if (timer == TRUE)
