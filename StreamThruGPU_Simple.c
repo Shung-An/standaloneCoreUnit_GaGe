@@ -1242,7 +1242,11 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 	int					demodulationWindowSize = g_ExpConfig.demodulation_window_size;		// Size of the demodulation window
 	uInt32				totalSegNum;														// Total number of segments in the data transfer
 	int					corrMatrixSize; 													// Size of the correlation matrix
-	int					segmentSize;														// Size of one segment in the input data 
+	int					segmentSize;	
+	int g_delta_samples = 0;
+	BOOL g_cal_valid = FALSE;// Size of one segment in the input data 
+	int gpu_skip0_samples = 0;
+	int gpu_skip1_samples = 0;
 
 	TCHAR msg[256] = { 0 };
 
@@ -1536,15 +1540,16 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 		// Convert the transfer size to BYTEs or WORDs depending on the card.
 		u32TransferSizeSamples = g_StreamConfig.u32BufferSizeBytes / g_CsSysInfo.u32SampleSize ;
 		int u32TransferSizeSamplesGPU = 0;
+		int paddingSizeForSkewCalibration = 2048 / g_CsSysInfo.u32SampleSize;
 
-		u32TransferSizeSamplesGPU = u32TransferSizeSamples*2;
+		u32TransferSizeSamplesGPU = u32TransferSizeSamples - paddingSizeForSkewCalibration;
 
-		segmentSize = demodulationWindowSize * 2;												// Size of one segment in the input data
+		segmentSize = demodulationWindowSize * 4;												// Size of one segment in the input data
 		corrMatrixSize = demodulationWindowSize * demodulationWindowSize;				// Size of the correlation matrix 
-		totalSegNum = u32TransferSizeSamplesGPU / segmentSize/2;										// Total number of segments in the data transfer
+		totalSegNum = u32TransferSizeSamplesGPU / segmentSize;										// Total number of segments in the data transfer
 		totalThreads = u32TransferSizeSamplesGPU * demodulationWindowSize / 4;					// Total number of threads lanuched in the kernel
 		sharedSegmentSize = blockSize * 4 / demodulationWindowSize;							// Size of the shared memory segment of one block
-		gridSize = (totalThreads + blockSize - 1) / blockSize;								// Number of blocks in the grid
+		gridSize = totalSegNum;								// Number of blocks in the grid
 
 
 		if (correlation_type == 0) {
@@ -1776,6 +1781,7 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 				const  int   nChan = 2;    // interleaved ABAB → 2 channels
 				const  int   calChan0 = 1;    // Data_1 ch2 -> index 1
 				const  int   calChan1 = 0;    // Data_2 ch1 -> index 0
+
 				// -------------------------------------------------
 				// 1) One-time calibration using HOST work buffers
 				// -------------------------------------------------
@@ -1839,22 +1845,31 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 					printf("\nCAL: Data_1 ch2 rising frame = %d, Data_2 ch1 rising frame = %d, Δ = %d frames\n",
 						cal_edge0, cal_edge1, cal_edge1 - cal_edge0);
 
-					// Compute recommended skips to lock edges at frame 89 in host indexing
-					const int target_frame = 93;
-					if (cal_edge0 > 0)
-						skip0_samples = (cal_edge0 > target_frame ? (cal_edge0 - target_frame) * nChan : 0);
-					if (cal_edge1 > 0)
-						skip1_samples = (cal_edge1 > target_frame ? (cal_edge1 - target_frame) * nChan : 0);
+					const int delta_frames = cal_edge1 - cal_edge0;
+					const int delta_samples = delta_frames * nChan;
+					g_delta_samples = delta_samples;   // store globally
+					gpu_skip0_samples = 16;
+					gpu_skip1_samples = 16 + delta_samples;
 
-					printf("CAL: suggested skip0 = %d samples, skip1 = %d samples (per card)\n",
-						skip0_samples, skip1_samples);
+
 
 					cal_done = TRUE;
+
+					if (cal_edge0 < 0 || cal_edge1 < 0) {
+						printf("\nCAL: Data_1 ch2 or Data_2 ch1 not found, exiting\n");
+						SetEvent(g_hStreamError);
+					}
+					else {
+						g_cal_valid = TRUE;
+					}
 				}
 
 
 				if (g_GpuConfig.bUseGpu && u32LoopCount>1)
 				{
+
+					short* d_in0 = (short*)d_buffer1 + gpu_skip0_samples;
+					short* d_in1 = (short*)d_buffer2 + gpu_skip1_samples;
 
 					if (timer == TRUE)
 						QueryPerformanceCounter(&process_start_time);	 // mark the start time of data processing	
@@ -1862,8 +1877,8 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 					if (correlation_type == 0) {
 						// perform cross correlation compute using GPU on the input data
 						cudaStatus = ComputeCrossCorrelationGPU(u32LoopCount,
-							(short*)d_buffer1,
-							(short*)d_buffer2,
+							d_in0,
+							d_in1,
 							u32TransferSizeSamplesGPU,
 							totalThreads,
 							gridSize,
@@ -1885,8 +1900,8 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 					else if (correlation_type == 1) {
 						// perform g2 correlation compute using GPU on the input data
 						cudaStatus = ComputeG2CorrelationGPU(u32LoopCount,
-							(short*)d_buffer1,
-							(short*)d_buffer2,
+							d_in0,
+							d_in1,
 							u32TransferSizeSamplesGPU,
 							totalThreads,
 							gridSize,
@@ -1936,26 +1951,82 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 				}
 			}
 
-
-			// Save the data to the hard disk
-			if (g_StreamConfig.bSaveToFile && NULL != pWorkBuffer1)
+			// Swap work buffers so that pWorkBuffer points to the buffer that was just filled		// Save the data to the hard disk
+			if (g_StreamConfig.bSaveToFile && pWorkBuffer1 && pWorkBuffer2 && g_cal_valid)
 			{
-				// While data transfer of the current buffer is in progress, save the data from pWorkBuffer to hard disk
-				dwBytesSave = 0;
-				bWriteSuccess = WriteFile(hFile, pWorkBuffer1, g_StreamConfig.u32BufferSizeBytes, &dwBytesSave, NULL);
-				bWriteSuccess = WriteFile(hFile2, pWorkBuffer2, g_StreamConfig.u32BufferSizeBytes, &dwBytesSave, NULL);
-				if (!bWriteSuccess || dwBytesSave != g_StreamConfig.u32BufferSizeBytes)
+				const int bytesPerSample = sizeof(short);
+				const int nSamplesPerBuf = g_StreamConfig.u32BufferSizeBytes / bytesPerSample;
+
+				// --- choose skips in SAMPLES, not bytes ---
+				// 16 here means "skip 16 samples" – if you meant frames, use 16 * nChan.
+				int skip0_samples = 16;                  // Data_1
+				int skip1_samples = 16 + g_delta_samples; // Data_2 aligned to Data_1
+
+				// Clamp negative skips to zero (in case delta < 0)
+				if (skip0_samples < 0) skip0_samples = 0;
+				if (skip1_samples < 0) skip1_samples = 0;
+
+				// Don’t go past the end
+				int maxSkip = (skip0_samples > skip1_samples) ? skip0_samples : skip1_samples;
+				int nSamplesOut = nSamplesPerBuf - maxSkip;
+				if (nSamplesOut < 0) nSamplesOut = 0;
+
+				// Compute pointers in SAMPLE units
+				short* out0 = (short*)pWorkBuffer1 + skip0_samples;
+				short* out1 = (short*)pWorkBuffer2 + skip1_samples;
+
+				DWORD bytesToWrite = (DWORD)nSamplesOut * bytesPerSample;
+
+				DWORD dwBytesSave = 0;
+				BOOL  bWriteSuccess;
+
+				// --- Write card 0 ---
+				bWriteSuccess = WriteFile(hFile,
+					out0,
+					bytesToWrite,
+					&dwBytesSave,
+					NULL);
+				if (!bWriteSuccess || dwBytesSave != bytesToWrite)
 				{
-					_ftprintf(stdout, _T("\nWriteFile() error on card %d !!! (GetLastError() = 0x%x\n"), nCardIndex, GetLastError());
+					_ftprintf(stdout, _T("\nWriteFile() error on card 0 !!! (GetLastError() = 0x%x)\n"),
+						GetLastError());
+					SetEvent(g_hStreamError);
+					bDone = TRUE;
+				}
+
+				// --- Write card 1 ---
+				bWriteSuccess = WriteFile(hFile2,
+					out1,
+					bytesToWrite,
+					&dwBytesSave,
+					NULL);
+				if (!bWriteSuccess || dwBytesSave != bytesToWrite)
+				{
+					_ftprintf(stdout, _T("\nWriteFile() error on card 1 !!! (GetLastError() = 0x%x)\n"),
+						GetLastError());
 					SetEvent(g_hStreamError);
 					bDone = TRUE;
 				}
 			}
 
-			if (NULL != pWorkBuffer1 && useIPC) {
-				int result = handleClientRequests(raw_signal_hPipe, pWorkBuffer1, pWorkBuffer2, h_odata, 0, 200, 0);  // 200 is the number of bytes to send, check request from client and send data
-			}
 
+			if (NULL != pWorkBuffer1 && useIPC) {
+				const int bytesPerSample = sizeof(short);
+
+				BYTE* ipcBuf0 = (BYTE*)pWorkBuffer1 + gpu_skip0_samples * bytesPerSample;
+				BYTE* ipcBuf1 = (BYTE*)pWorkBuffer2 + gpu_skip1_samples * bytesPerSample;
+
+				// 200 = number of bytes to send (unchanged)
+				int result = handleClientRequests(
+					raw_signal_hPipe,
+					ipcBuf0,
+					ipcBuf1,
+					h_odata,
+					0,
+					200,
+					0);
+			}
+				
 
 			// Wait for the DMA transfer on the current buffer to complete so we can loop back around to start a new one.
 			// The calling thread will sleep until the transfer completes
