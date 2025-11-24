@@ -220,12 +220,62 @@ CSGPUCONFIG					g_GpuConfig = { 0 };	// GPU configuration
 EXPCONFIG					g_ExpConfig;	// Experiment configuration
 CS_STRUCT_DATAFORMAT_INFO	g_DataFormatInfo = { 0 };
 double						diff_time[MAX_CARDS_COUNT] = { 0. };
+// NEW:
+HANDLE   g_hStreamRestart = NULL;   // signaled when we want an automatic restart
 
 typedef struct {
 	int  systemIdx;     // 0 or 1
 	CSHANDLE hSystem;   // g_hSystem[systemIdx]
 	uInt16 cardIndex;   // always 1 for single-card boards
 } ThreadArg;
+
+
+static void RestartMyself(void)
+{
+	TCHAR modulePath[MAX_PATH];
+
+	// Get full path to current .exe
+	DWORD len = GetModuleFileName(NULL, modulePath, MAX_PATH);
+	if (len == 0 || len == MAX_PATH) {
+		_ftprintf(stderr, _T("RestartMyself: GetModuleFileName failed (err=%lu)\n"),
+			GetLastError());
+		return; // fall back: just continue / exit normally
+	}
+
+	STARTUPINFO si;
+	PROCESS_INFORMATION pi;
+	ZeroMemory(&si, sizeof(si));
+	ZeroMemory(&pi, sizeof(pi));
+	si.cb = sizeof(si);
+
+	// Optional: small delay to avoid crazy fast restart loop
+	Sleep(2000);
+
+	BOOL ok = CreateProcess(
+		modulePath,   // application name = same EXE
+		NULL,         // command line (reuse default)
+		NULL, NULL,   // process / thread security
+		FALSE,
+		0,
+		NULL,
+		NULL,
+		&si,
+		&pi
+	);
+
+	if (!ok) {
+		_ftprintf(stderr, _T("RestartMyself: CreateProcess failed (err=%lu)\n"),
+			GetLastError());
+		return;
+	}
+
+	// We don't need the handles
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+
+	// Kill current process so only the new one lives
+	ExitProcess(0);
+}
 
 
 int _tmain()
@@ -753,6 +803,25 @@ int _tmain()
 	}
 
 	free(args);
+
+	// If calibration (or some worker) asked for an automatic restart,
+	// we only do it *after* the normal cleanup path has finished.
+	if (g_hStreamRestart &&
+		WaitForSingleObject(g_hStreamRestart, 0) == WAIT_OBJECT_0)
+	{
+		printf("\n[MAIN] Restart flag detected. Restarting program...\n");
+
+		// Optional: clear it so child process / future runs don't see it
+		ResetEvent(g_hStreamRestart);
+
+		// Option A: self-relaunch via RestartMyself()
+		RestartMyself();  // will only return if it failed
+
+		// If RestartMyself fails for some reason, fall back to exit with error
+		return 1;
+	}
+
+	// normal exit
 	return 0;
 }
 
@@ -813,6 +882,13 @@ static int InitEvents(int nSystems) {
 			!g_hStreamAbort[i] || !g_hStreamError[i]) {
 			return -1; // handle error/log GetLastError()
 		}
+	}
+
+	// NEW: one global restart event
+	if (!g_hStreamRestart) {
+		g_hStreamRestart = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+		if (!g_hStreamRestart)
+			return -1;
 	}
 	return 0;
 }
@@ -1848,8 +1924,60 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 					const int delta_frames = cal_edge1 - cal_edge0;
 					const int delta_samples = delta_frames * nChan;
 					g_delta_samples = delta_samples;   // store globally
-					gpu_skip0_samples = 16;
-					gpu_skip1_samples = 16 + delta_samples;
+
+					// ------------------------------------------------------
+					// Triangular lock on Data_1 ch1 (period = 8 samples)
+					//
+					// Goal: in the GPU view, the peak of Data_1 ch1 should
+					//       appear at the 2nd sample (frame index 2).
+					//
+					// We assume:
+					//   - Data_1 has 2 interleaved channels (A = ch1, B = ch2)
+					//   - ch0 = Data_1 ch1 (triangle), ch1 = Data_1 ch2 (cal)
+					//   - base GPU skip = 16 samples (8 frames), i.e. base_frame % 8 = 0
+					// ------------------------------------------------------
+					const int triChan = 0;      // Data_1 ch1 (triangle)
+					const int period = 8;      // 8-sample period
+					int tri_peak_frame = -1;
+					double tri_peak_val = -1e30;
+
+					// Scan the first 8 frames of Data_1 ch1
+					int maxTriFrames = (nFrames < period) ? nFrames : period;
+					for (int i = 0; i < maxTriFrames; ++i)
+					{
+						double v = (double)p0[i * nChan + triChan];
+						if (v > tri_peak_val)
+						{
+							tri_peak_val = v;
+							tri_peak_frame = i;     // frame index (0..7)
+						}
+					}
+
+					// Default base skip: 16 samples (8 frames)
+					int base_skip_samples = 16;
+
+					int extra_frames = 0;
+					if (tri_peak_frame >= 0)
+					{
+						// We want: (start_frame + 2) ≡ tri_peak_frame (mod 8)
+						// start_frame = base_frame + extra_frames
+						// base_frame = base_skip_samples / nChan = 8 -> 0 mod 8
+						// => extra_frames ≡ tri_peak_frame - 2 (mod 8)
+						extra_frames = (tri_peak_frame - 2) & (period - 1); // mod 8
+
+						printf("CAL: triangle peak frame = %d, extra_frames = %d\n",
+							tri_peak_frame, extra_frames);
+					}
+
+					// Convert extra_frames to samples and apply to both boards
+					int extra_samples = extra_frames * nChan;
+
+					gpu_skip0_samples = base_skip_samples + extra_samples;
+					gpu_skip1_samples = gpu_skip0_samples + delta_samples;
+
+					printf("CAL: gpu_skip0_samples = %d, gpu_skip1_samples = %d\n",
+						gpu_skip0_samples, gpu_skip1_samples);
+
 
 
 
@@ -1857,7 +1985,18 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 
 					if (cal_edge0 < 0 || cal_edge1 < 0) {
 						printf("\nCAL: Data_1 ch2 or Data_2 ch1 not found, exiting\n");
-						SetEvent(g_hStreamError);
+						SetEvent(g_hStreamError[i]);
+
+						SetEvent(g_hStreamAbort[0]);
+						SetEvent(g_hStreamAbort[1]);
+
+						// tell main that this abort wants an automatic restart
+						if (g_hStreamRestart)
+							SetEvent(g_hStreamRestart);
+
+
+						// In case RestartMyself() fails:
+						return 0;
 					}
 					else {
 						g_cal_valid = TRUE;
