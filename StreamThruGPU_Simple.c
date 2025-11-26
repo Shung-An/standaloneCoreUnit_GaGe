@@ -1624,8 +1624,8 @@ DWORD WINAPI CardStreamThread(LPVOID lpParam)
 		corrMatrixSize = demodulationWindowSize * demodulationWindowSize;				// Size of the correlation matrix 
 		totalSegNum = u32TransferSizeSamplesGPU / segmentSize;										// Total number of segments in the data transfer
 		totalThreads = u32TransferSizeSamplesGPU * demodulationWindowSize / 4;					// Total number of threads lanuched in the kernel
-		sharedSegmentSize = blockSize * 4 / demodulationWindowSize;							// Size of the shared memory segment of one block
-		gridSize = totalSegNum;								// Number of blocks in the grid
+		sharedSegmentSize = blockSize *4 / demodulationWindowSize ;							// Size of the shared memory segment of one block
+		gridSize = (totalThreads + blockSize - 1) / blockSize;								// Number of blocks in the grid
 
 
 		if (correlation_type == 0) {

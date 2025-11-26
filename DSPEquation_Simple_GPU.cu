@@ -28,76 +28,57 @@ void checkCublas(cublasStatus_t result, const char* msg) {
 
 
 
+
 // One segment per block.
-// dataA: board1, ABAB...
-// dataB: board2, ABAB...
+// dataA: board1, ABAB... (A,B,A,B,...)
+// dataB: board2, ABAB... (A,B,A,B,...)
 __global__ void demodulationCrossCorrelation(
-	short* dataA,
-	short* dataB,
-	__int64 numElements,             // SAMPLES per board (ABAB)
-	double* aggregatedCorrMatrix,    // [gridDim.x * corrMatrixSize]
-	const int sharedSegmentSize,     // should be 2 * segmentSize (in doubles)
-	const int totalThreads,          // unused
-	const int demodulationWindowSize,// W
-	const int corrMatrixSize,        // W * W
-	const int segmentSize)           // FRAMES per segment (usually 2*W)
+	const short* __restrict__ dataA,
+	const short* __restrict__ dataB,
+	const long long numElements,              // total *samples* per board (ABAB)
+	double* __restrict__ aggregatedCorrMatrix,
+	const int sharedSegmentSize,              // unused except for sanity; segmentSize <= sharedSegmentSize
+	const int totalThreads,                   // unused
+	const int demodulationWindowSize,                              // demodulationWindowSize
+	const int corrMatrixSize,                 // W * W
+	const int segmentSize                     // in FRAMES, usually 2*W
+)
 {
-	const int seg = blockIdx.x;   // segment index
-	const int W = demodulationWindowSize;
-	const int nChan = 2;            // AB pattern per board
-	const int segmentFrames = 2 * W;                   // 16
+	int index = blockDim.x * blockIdx.x + threadIdx.x;
 
-	const long long nFrames = numElements / nChan;       // frames per board
-	const long long baseFrame = 1LL * seg * segmentFrames;   // starting frame for this segment
 
-	// We need frames [baseFrame .. baseFrame + segmentSize - 1]
-	if (baseFrame + segmentFrames > nFrames) {
-		return;
-	}
-
+	// Declare shared memory
 	extern __shared__ double sharedSegment[];
-	double* sA = sharedSegment;                  // [segmentSize] frames of board1 A
-	double* sB = sharedSegment + segmentFrames;    // [segmentSize] frames of board2 B
 
-	// ---------------- load this segment into shared memory ----------------
-	for (int i = threadIdx.x; i < segmentFrames; i += blockDim.x) {
-		long long frame = baseFrame + i;
-		long long baseSample = frame * nChan;
-
-		long long idxA = baseSample + 0;         // board1 A
-		long long idxB = baseSample + 1;         // board2 B
-
-		sA[i] = (double)dataA[idxA];
-		sB[i] = (double)dataB[idxB];
-
-		 //Debug: see which indices we actually use
- 
-		   /*  printf("[LOAD] seg=%d tid=%d i=%d frame=%lld idxA=%lld idxB=%lld\n",
-		            seg, threadIdx.x, i, frame, idxA, idxB);
-		 */
+	// Only the first 32 threads in the block load data into shared memory
+	if (threadIdx.x < sharedSegmentSize) {
+		if (threadIdx.x % 2 == 0) {
+			sharedSegment[threadIdx.x] = static_cast<double>(dataA[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		}
+		else {
+			sharedSegment[threadIdx.x] = static_cast<double>(dataB[blockIdx.x * sharedSegmentSize + threadIdx.x]);
+		}
 	}
+
 	__syncthreads();
 
-	// ---------------- compute W×W correlation tile for this segment ----------
-	// (blockDim.x = 256, corrMatrixSize = W*W = 64. Threads stride.)
-	for (int k = threadIdx.x; k < corrMatrixSize; k += blockDim.x) {
-		int row = k / W;   // 0..W-1
-		int col = k % W;   // 0..W-1
+	if (index < totalThreads) {
+		int row = threadIdx.x % corrMatrixSize / demodulationWindowSize;
+		int col = threadIdx.x % demodulationWindowSize;
 
-		if (row + W >= segmentFrames || col + W >= segmentFrames)
-			continue;
+		int segmentStart = threadIdx.x / corrMatrixSize * segmentSize; // Determine the starting index of the segment in shared memory
 
-		double a0 = sA[row];
-		double a1 = sA[row + W];
-		double b0 = sB[col];
-		double b1 = sB[col + W];
+		double value1 = sharedSegment[segmentStart + row * 2];
+		double value2 = sharedSegment[segmentStart + (row + demodulationWindowSize) * 2];
+		double value3 = sharedSegment[segmentStart + col * 2 + 1];
+		double value4 = sharedSegment[segmentStart + (col + demodulationWindowSize) * 2 + 1];
 
-		double corrValue = (a0 - a1) * (b0 - b1);
+		double corrValue = (value1 - value2) * (value3 - value4);
 
-		int outIdx = seg * corrMatrixSize + row * W + col;
-		aggregatedCorrMatrix[outIdx] = corrValue;
+		aggregatedCorrMatrix[index] = corrValue; // Correlation matrix, one column is a single correlation matrix, column-major order
 	}
 }
+
 
 __global__ void demodulationAutoCorrelation(short* data,
 	short* dataB,
@@ -276,78 +257,58 @@ extern "C" cudaError_t ComputeCrossCorrelationGPU(const __int64 u32LoopCount,			
 	// Compute the correlation matrix for each segment of data chunked by demodulation window policy
 	// Allocate host memory for verification
 	//	
-	//checkCuda(cudaMemcpy(h_dataA, data, size  * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed1");
-	//checkCuda(cudaMemcpy(h_dataB, dataB, size * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed2");
-	//checkCuda(cudaMemcpy(h_aggregatedCorrMatrix, d_aggregatedCorrMatrix, (size_t)totalSegNum * corrMatrixSize * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed3");
-
-	// --- CPU side parameters (must match kernel launch) ---
-	// --- define segment in FRAMES, not samples ---
+//	checkCuda(cudaMemcpy(h_dataA, data, size  * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed1");
+//	checkCuda(cudaMemcpy(h_dataB, dataB, size * sizeof(short), cudaMemcpyDeviceToHost), "cudaMemcpy failed2");
+//	checkCuda(cudaMemcpy(h_aggregatedCorrMatrix, d_aggregatedCorrMatrix, (size_t)totalSegNum * corrMatrixSize * sizeof(double), cudaMemcpyDeviceToHost), "cudaMemcpy failed3");
+///////////////////////////////////	 //--- CPU side parameters (must match kernel launch) ---
+	////////////////////////////// //--- define segment in FRAMES, not samples ---
 	//const int   nChan = 2;                         // AB
 	//const int   W = demodulationWindowSize;    // 8
 	//const int   segmentFrames = 2 * W;                     // 16 frames per segment
 	//const int   corrSize = W * W;                     // 64
-
 	//const int   numSamples = (int)size;                 // 3072 samples per board
 	//const long long nFrames = numSamples / nChan;        // 1536 frames
-
 	//for (int i = 0; i < corrMatrixSize; ++i) {
 	//	h_dataAB[i] = 0;
 	//}
-
-
 	//FILE* fcmp = fopen("corr_compare.txt", "w");
 	//fprintf(fcmp, "SEG\tidx\tCPU\tGPU\n");
-
 	//for (int seg = 0; seg < totalSegNum; ++seg) {
 	//	long long baseFrame = 1LL * seg * segmentFrames;   // frame index
-
 	//	for (int row = 0; row < W; ++row) {
 	//		long long frame0A = baseFrame + row;
 	//		long long frame1A = baseFrame + W + row;
-
 	//		long long idxA0 = frame0A * nChan + 0;         // board1, chan A
 	//		long long idxA1 = frame1A * nChan + 0;
-
 	//		double da = (double)h_dataA[idxA0] - (double)h_dataA[idxA1];
-
 	//		for (int col = 0; col < W; ++col) {
 	//			long long frame0B = baseFrame + col;
 	//			long long frame1B = baseFrame + W + col;
-
 	//			long long idxB0 = frame0B * nChan + 1;     // board2, chan B
 	//			long long idxB1 = frame1B * nChan + 1;
-
 	//			double db = (double)h_dataB[idxB0] - (double)h_dataB[idxB1];
-
 	//			int idx = row * W + col;                   // 0..63
-
 	//			double corr = da * db;                  // CPU per-seg value
 	//			double gpuCorr = h_aggregatedCorrMatrix[seg * corrSize + idx];
 	//			h_dataAB[idx] += corr;               // accumulate over segments
-	//			fprintf(fcmp, "%d\t%d\t%.10f\t%.10f\t%d\t%d\t%d\t%d\n",
-	//				seg, idx, corr, gpuCorr, idxA0, idxA1, idxB0, idxB1);
+	//			//fprintf(fcmp, "%d\t%d\t%.10f\t%.10f\t%d\t%d\t%d\t%d\n",
+	//			//	seg, idx, corr, gpuCorr, idxA0, idxA1, idxB0, idxB1);
 	//		}
 	//	}
 	//}
-
 	//fclose(fcmp);
-
 	//	printf("Saved CPU/GPU comparison to corr_compare.txt\n");
 	//
-
 	//// 3) normalize by totalSegNum and compare with h_odata
 	//double norm = (double)totalSegNum;
 	//const double eps = 1e-12;
-
 	//for (int i = 0; i < corrMatrixSize; ++i) {
 	//	double cpu_val = h_dataAB[i] / norm;
 	//	double gpu_val = h_odata[i];
-
 	//	if (fabs(cpu_val - gpu_val) > 1e-9) {
 	//		printf("MISMATCH idx=%d  CPU=%.10e  GPU=%.10e\n",
 	//			i, cpu_val, gpu_val);
 	//	}
-
 	//}
 	/////////////////////////////////////////////////////////////
 	////////////////////////////////////////////////////////////////
